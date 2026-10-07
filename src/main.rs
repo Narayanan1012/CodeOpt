@@ -4,7 +4,7 @@ use std::fs;
 use codeopt::cfg::build;
 use codeopt::parser::parse_program;
 use codeopt::passes::optimize_with_worklist;
-use codeopt::tui::{build_demo, run_tui};
+use codeopt::tui::{BenchmarkCorpus, run_workbench};
 use codeopt::verification::verify;
 use codeopt::vm::execute;
 
@@ -139,28 +139,8 @@ fn main() {
             println!("\nOptimized TAC:\n{program}");
         }
         "tui" => {
-            let path = env::args()
-                .nth(2)
-                .unwrap_or_else(|| "benchmarks/cse_01.tac".to_owned());
-            let inputs = env::args()
-                .nth(3)
-                .map(|raw_inputs| parse_inputs(&raw_inputs))
-                .unwrap_or_else(|| {
-                    if path == "benchmarks/cse_01.tac" {
-                        vec![4, 9]
-                    } else {
-                        Vec::new()
-                    }
-                });
-            let source = fs::read_to_string(&path).unwrap_or_else(|error| {
-                eprintln!("Could not read `{path}`: {error}");
-                std::process::exit(1);
-            });
-            let demo = build_demo(&source, &inputs).unwrap_or_else(|error| {
-                eprintln!("Could not prepare TUI demo: {error}");
-                std::process::exit(1);
-            });
-            if let Err(error) = run_tui(demo) {
+            let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
+            if let Err(error) = run_workbench(corpus) {
                 eprintln!("TUI failed: {error}");
                 std::process::exit(1);
             }
