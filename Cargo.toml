@@ -1,0 +1,9 @@
+[package]
+name = "codeopt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "A course-sized three-address-code optimizer"
+license = "MIT"
+
+[dependencies]

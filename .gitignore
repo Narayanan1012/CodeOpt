@@ -1,0 +1,9 @@
+/target/
+*.swp
+.DS_Store
+
+# Local planning, reports, and presentation material. The root README remains
+# the sole tracked Markdown document.
+/docs/
+*.md
+!/README.md
