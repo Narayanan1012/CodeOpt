@@ -7,3 +7,5 @@ description = "A course-sized three-address-code optimizer"
 license = "MIT"
 
 [dependencies]
+crossterm = "0.28.1"
+ratatui = "0.29.0"
