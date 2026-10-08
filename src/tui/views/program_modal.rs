@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Wrap},
 };
 
 use crate::tui::{
@@ -145,6 +145,9 @@ fn render_code_diff_panes(
                     crate::passes::OptimizationKind::LocalCommonSubexpressionElimination => {
                         Span::styled("[CSE] ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD))
                     }
+                    crate::passes::OptimizationKind::DeadCodeElimination => {
+                        Span::styled("[DCE] ", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))
+                    }
                 }
             } else {
                 Span::raw("      ")
@@ -214,7 +217,15 @@ fn render_bottom_split(
         .wrap(Wrap { trim: false });
     frame.render_widget(audit_widget, columns[0]);
 
-    // Right: Quantitative Performance Metrics & Equivalence Check
+    // Right Column: Split into Quantitative Performance Metrics (Top) and Dual VM Proof Table (Bottom)
+    let right_splits = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8), // Metrics
+            Constraint::Min(8),    // 5-Vector Proof Table
+        ])
+        .split(columns[1]);
+
     let stats_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -237,47 +248,81 @@ fn render_bottom_split(
     let stats_lines = vec![
         Line::from(vec![
             Span::styled(" Instruction Count:    ", Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(format!("{} → {}  ", item.original_stats.instruction_count, item.optimized_stats.instruction_count), Style::default().fg(COLOR_TEXT_BODY)),
+            Span::styled(format!("{} → {} ", item.original_stats.instruction_count, item.optimized_stats.instruction_count), Style::default().fg(COLOR_TEXT_BODY)),
             Span::styled(format!("(-{inst_red:.1}%) "), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
             Span::styled("[Target: 20–50%]", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled("   │ TAC Code Size: ", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled(format!("{}B → {}B ", item.original_stats.code_size_bytes, item.optimized_stats.code_size_bytes), Style::default().fg(COLOR_TEXT_BODY)),
+            Span::styled(format!("(-{size_red:.1}%)"), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
             Span::styled(" Arithmetic Operations:", Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(format!("{} → {}  ", item.original_stats.arithmetic_count, item.optimized_stats.arithmetic_count), Style::default().fg(COLOR_TEXT_BODY)),
+            Span::styled(format!("{} → {} ", item.original_stats.arithmetic_count, item.optimized_stats.arithmetic_count), Style::default().fg(COLOR_TEXT_BODY)),
             Span::styled(format!("(-{arith_red:.1}%) "), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
             Span::styled("[Target: 30–60%]", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled("   │ Temporaries  : ", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled(format!("{} → {} ", item.original_stats.temp_count, item.optimized_stats.temp_count), Style::default().fg(COLOR_TEXT_BODY)),
+            Span::styled(format!("(-{temp_red:.1}%)"), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(vec![
-            Span::styled(" Temporary Variables:  ", Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(format!("{} → {}  ", item.original_stats.temp_count, item.optimized_stats.temp_count), Style::default().fg(COLOR_TEXT_BODY)),
-            Span::styled(format!("(-{temp_red:.1}%) "), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
-            Span::styled("[Target: 20–40%]", Style::default().fg(COLOR_TEXT_MUTED)),
-        ]),
-        Line::from(vec![
-            Span::styled(" TAC Code Size (Bytes):", Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(format!("{}B → {}B  ", item.original_stats.code_size_bytes, item.optimized_stats.code_size_bytes), Style::default().fg(COLOR_TEXT_BODY)),
-            Span::styled(format!("(-{size_red:.1}%) "), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
-            Span::styled("[Target: 15–40%]", Style::default().fg(COLOR_TEXT_MUTED)),
-        ]),
-        Line::from(""),
         Line::from(vec![
             Span::styled(" VM Execution Timing:  ", Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{}µs → {}µs  ", item.time_original_us, item.time_optimized_us), Style::default().fg(COLOR_TEXT_HEAD)),
             Span::styled(format!("({:+.1}% time | {:.2}x speedup)", item.speedup_pct, speedup_x), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" Differential Check:   ", Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(format!("Orig Out: {:?}  │  Opt Out: {:?}", item.original_outputs, item.optimized_outputs), Style::default().fg(COLOR_TEXT_BODY)),
-        ]),
-        Line::from(vec![
-            Span::styled(" Semantic Equivalence: ", Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled("CONFIRMED 100% IDENTICAL OUTPUTS", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
-        ]),
     ];
 
     let stats_widget = Paragraph::new(stats_lines).block(stats_block);
-    frame.render_widget(stats_widget, columns[1]);
+    frame.render_widget(stats_widget, right_splits[0]);
+
+    // 5-Vector Dual VM Semantic Equivalence Proof Table
+    let proof_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(if item.verification_passed {
+            Style::default().fg(COLOR_SUCCESS)
+        } else {
+            Style::default().fg(COLOR_DANGER)
+        })
+        .title(Line::from(vec![
+            Span::styled(" Dual VM Semantic Equivalence Proof (5 Test Vectors Executed) ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+        ]));
+
+    let header = Row::new(vec![
+        Cell::from("Vec #").style(Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+        Cell::from("Test Input Vector").style(Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
+        Cell::from("Original VM Output").style(Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
+        Cell::from("Optimized VM Output").style(Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+        Cell::from("Equivalence Verdict").style(Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
+    ])
+    .style(Style::default().bg(crate::tui::theme::COLOR_PANEL_BG));
+
+    let rows: Vec<Row> = item.test_vectors.iter().map(|v| {
+        let status_cell = if v.passed {
+            Cell::from("✓ PASS (100% IDENTICAL)").style(Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
+        } else {
+            Cell::from("✗ MISMATCH").style(Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))
+        };
+        Row::new(vec![
+            Cell::from(format!("#{}", v.vector_id)).style(Style::default().fg(COLOR_TEXT_MUTED)),
+            Cell::from(format!("{:?}", v.inputs)).style(Style::default().fg(COLOR_TEXT_BODY)),
+            Cell::from(format!("{:?}", v.original_output)).style(Style::default().fg(COLOR_INDIGO)),
+            Cell::from(format!("{:?}", v.optimized_output)).style(Style::default().fg(COLOR_SUCCESS)),
+            status_cell,
+        ])
+    }).collect();
+
+    let widths = [
+        Constraint::Length(6),
+        Constraint::Percentage(25),
+        Constraint::Percentage(24),
+        Constraint::Percentage(24),
+        Constraint::Percentage(21),
+    ];
+
+    let proof_table = Table::new(rows, widths)
+        .header(header)
+        .block(proof_block);
+    frame.render_widget(proof_table, right_splits[1]);
 }
 
 fn render_modal_footer(frame: &mut Frame, area: Rect) {

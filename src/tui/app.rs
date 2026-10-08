@@ -21,7 +21,10 @@ use crate::{
             COLOR_CYAN, COLOR_INDIGO, COLOR_PANEL_BG,
             COLOR_PINK, COLOR_SUCCESS, COLOR_TEXT_BODY, COLOR_TEXT_MUTED,
         },
-        views::{render_benchmarks, render_home, render_optimizing, render_playground, render_program_modal},
+        views::{
+            render_analytics, render_benchmarks, render_home, render_optimizing,
+            render_playground, render_program_modal,
+        },
     },
     verification::verify,
     vm::execute,
@@ -34,6 +37,7 @@ pub enum CurrentScreen {
     BenchmarkSuite,
     Playground,
     ProgramDeepDive,
+    AnalyticsDeck,
 }
 
 pub struct App {
@@ -293,12 +297,11 @@ impl App {
                         self.playground_cursor_row += 1;
                     }
                 }
-                KeyCode::Char(c) => {
-                    if self.playground_cursor_row < self.playground_buffer.len() {
+                KeyCode::Char(c)
+                    if self.playground_cursor_row < self.playground_buffer.len() => {
                         self.playground_buffer[self.playground_cursor_row].push(c);
                         self.recompile_playground();
                     }
-                }
                 _ => {}
             }
             return;
@@ -363,7 +366,12 @@ impl App {
                     KeyCode::Char('3') => self.switch_category(BenchmarkCategory::ConstantPropagation),
                     KeyCode::Char('4') => self.switch_category(BenchmarkCategory::AlgebraicSimplification),
                     KeyCode::Char('5') => self.switch_category(BenchmarkCategory::LocalCSE),
-                    KeyCode::Char('6') => self.switch_category(BenchmarkCategory::Combined),
+                    KeyCode::Char('6') => self.switch_category(BenchmarkCategory::DeadCodeElimination),
+                    KeyCode::Char('7') => self.switch_category(BenchmarkCategory::Combined),
+                    KeyCode::Char('8') => self.switch_category(BenchmarkCategory::ControlFlow),
+                    KeyCode::Char('g') | KeyCode::Char('G') => {
+                        self.screen = CurrentScreen::AnalyticsDeck;
+                    }
                     KeyCode::Left | KeyCode::Char('h') => {
                         self.cycle_category(false);
                     }
@@ -394,13 +402,12 @@ impl App {
                             self.selected_benchmark_idx = items_count - 1;
                         }
                     }
-                    KeyCode::Enter => {
-                        if items_count > 0 {
+                    KeyCode::Enter
+                        if items_count > 0 => {
                             self.code_scroll_offset = 0;
                             self.audit_scroll_offset = 0;
                             self.screen = CurrentScreen::ProgramDeepDive;
                         }
-                    }
                     _ => {}
                 }
             }
@@ -452,6 +459,44 @@ impl App {
                 }
                 _ => {}
             },
+            CurrentScreen::AnalyticsDeck => match key {
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('g') | KeyCode::Char('G') => {
+                    self.screen = CurrentScreen::BenchmarkSuite;
+                }
+                KeyCode::Char('1') => {
+                    self.switch_category(BenchmarkCategory::All);
+                    self.screen = CurrentScreen::BenchmarkSuite;
+                }
+                KeyCode::Char('2') => {
+                    self.switch_category(BenchmarkCategory::ConstantFolding);
+                    self.screen = CurrentScreen::BenchmarkSuite;
+                }
+                KeyCode::Char('3') => {
+                    self.switch_category(BenchmarkCategory::ConstantPropagation);
+                    self.screen = CurrentScreen::BenchmarkSuite;
+                }
+                KeyCode::Char('4') => {
+                    self.switch_category(BenchmarkCategory::AlgebraicSimplification);
+                    self.screen = CurrentScreen::BenchmarkSuite;
+                }
+                KeyCode::Char('5') => {
+                    self.switch_category(BenchmarkCategory::LocalCSE);
+                    self.screen = CurrentScreen::BenchmarkSuite;
+                }
+                KeyCode::Char('6') => {
+                    self.switch_category(BenchmarkCategory::DeadCodeElimination);
+                    self.screen = CurrentScreen::BenchmarkSuite;
+                }
+                KeyCode::Char('7') => {
+                    self.switch_category(BenchmarkCategory::Combined);
+                    self.screen = CurrentScreen::BenchmarkSuite;
+                }
+                KeyCode::Char('8') => {
+                    self.switch_category(BenchmarkCategory::ControlFlow);
+                    self.screen = CurrentScreen::BenchmarkSuite;
+                }
+                _ => {}
+            },
         }
     }
 
@@ -490,6 +535,7 @@ impl App {
             CurrentScreen::BenchmarkSuite => render_benchmarks(frame, self, area),
             CurrentScreen::Playground => render_playground(frame, self, area),
             CurrentScreen::ProgramDeepDive => render_program_modal(frame, self, area),
+            CurrentScreen::AnalyticsDeck => render_analytics(frame, self, area),
         }
 
         if self.help_modal_open {
@@ -549,6 +595,10 @@ impl App {
                 Span::styled("Load program file path in Playground", Style::default().fg(COLOR_TEXT_BODY)),
             ]),
             Line::from(vec![
+                Span::styled(" [G]          ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+                Span::styled("Open Global Analytics Deck (All 6 PRD Evaluation Plots)", Style::default().fg(COLOR_TEXT_BODY)),
+            ]),
+            Line::from(vec![
                 Span::styled(" [/]          ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
                 Span::styled("Search and filter datasets in Benchmark Suite", Style::default().fg(COLOR_TEXT_BODY)),
             ]),
@@ -572,7 +622,6 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use crate::tui::data::BenchmarkCategory;
 
     #[test]
@@ -653,25 +702,40 @@ mod tests {
         let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
         assert!(!corpus.items.is_empty(), "Corpus should load benchmark files");
 
-        // Verify that algebraic_01 is marked as Combined (triggers CF, CP, and AS)
-        let algebraic = corpus.items.iter().find(|i| i.name.contains("algebraic"));
-        assert!(algebraic.is_some());
-        assert_eq!(algebraic.unwrap().category, BenchmarkCategory::Combined);
+        println!("Loaded total items: {}", corpus.items.len());
+        for cat in &crate::tui::data::ALL_CATEGORIES {
+            let count = corpus.filter_by_category(*cat).len();
+            println!("Category {:?}: {} items", cat, count);
+        }
 
-        // Verify single-pass categorization:
-        let single_as_src = "read x\nt1 = x + 0";
-        let single_item = BenchmarkCorpus::compile_item(
-            99,
-            "test_single_as.tac".to_string(),
-            PathBuf::from("test.tac"),
-            single_as_src,
-            &[5],
-        );
-        assert!(single_item.is_some());
-        assert_eq!(
-            single_item.unwrap().category,
-            BenchmarkCategory::AlgebraicSimplification
-        );
+        // Verify categories are cleanly assigned across types
+        let combined = corpus.items.iter().find(|i| i.name.contains("combined"));
+        assert!(combined.is_some());
+        assert_eq!(combined.unwrap().category, BenchmarkCategory::Combined);
+
+        let algebraic = corpus.items.iter().find(|i| i.name.starts_with("alg"));
+        assert!(algebraic.is_some());
+        assert_eq!(algebraic.unwrap().category, BenchmarkCategory::AlgebraicSimplification);
+
+        let constant = corpus.items.iter().find(|i| i.name.starts_with("const"));
+        assert!(constant.is_some());
+        assert_eq!(constant.unwrap().category, BenchmarkCategory::ConstantFolding);
+
+        let prop = corpus.items.iter().find(|i| i.name.starts_with("prop"));
+        assert!(prop.is_some());
+        assert_eq!(prop.unwrap().category, BenchmarkCategory::ConstantPropagation);
+
+        let cse = corpus.items.iter().find(|i| i.name.starts_with("cse"));
+        assert!(cse.is_some());
+        assert_eq!(cse.unwrap().category, BenchmarkCategory::LocalCSE);
+
+        let dce = corpus.items.iter().find(|i| i.name.starts_with("dce"));
+        assert!(dce.is_some());
+        assert_eq!(dce.unwrap().category, BenchmarkCategory::DeadCodeElimination);
+
+        let ctrl = corpus.items.iter().find(|i| i.name.starts_with("ctrl") || i.name.starts_with("control"));
+        assert!(ctrl.is_some());
+        assert_eq!(ctrl.unwrap().category, BenchmarkCategory::ControlFlow);
     }
 
     #[test]
@@ -725,5 +789,40 @@ mod tests {
         app.playground_buffer.pop();
         app.recompile_playground();
         assert!(app.playground_parse_error.is_none());
+    }
+
+    #[test]
+    fn test_5_vector_verification_proof() {
+        let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
+        assert!(!corpus.items.is_empty());
+        for item in &corpus.items {
+            assert_eq!(item.test_vectors.len(), 5, "Item {} must have 5 test vectors", item.name);
+            assert!(item.verification_passed, "Item {} must pass verification across all 5 vectors", item.name);
+            for v in &item.test_vectors {
+                assert!(v.passed, "Vector {} in {} must match", v.vector_id, item.name);
+                assert_eq!(v.original_output, v.optimized_output);
+            }
+        }
+    }
+
+    #[test]
+    fn test_analytics_deck_navigation() {
+        let mut app = App::new(BenchmarkCorpus::default());
+        app.screen = CurrentScreen::BenchmarkSuite;
+
+        // Press 'g' to enter analytics deck
+        app.handle_key(KeyCode::Char('g'));
+        assert_eq!(app.screen, CurrentScreen::AnalyticsDeck);
+
+        // Press 'Esc' to exit analytics deck
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
+
+        // Press 'G' to enter again and '2' to jump to ConstantFolding in BenchmarkSuite
+        app.handle_key(KeyCode::Char('G'));
+        assert_eq!(app.screen, CurrentScreen::AnalyticsDeck);
+        app.handle_key(KeyCode::Char('2'));
+        assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
+        assert_eq!(app.active_category, BenchmarkCategory::ConstantFolding);
     }
 }

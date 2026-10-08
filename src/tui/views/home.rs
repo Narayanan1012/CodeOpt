@@ -103,7 +103,7 @@ fn render_ascii_hero(frame: &mut Frame, _app: &App, area: Rect) {
 fn render_subtitle_pulse(frame: &mut Frame, app: &App, area: Rect) {
     let pulse_chars = ["●", "◉", "○", "◉"];
     let pulse_char = pulse_chars[(app.tick_count / 2) % pulse_chars.len()];
-    let pulse_color = if (app.tick_count / 2) % 2 == 0 {
+    let pulse_color = if (app.tick_count / 2).is_multiple_of(2) {
         COLOR_SUCCESS
     } else {
         COLOR_CYAN

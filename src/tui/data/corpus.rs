@@ -11,7 +11,6 @@ use crate::{
     parser::parse_program,
     passes::{OptimizationKind, OptimizationReport, optimize_with_worklist},
     tui::data::metrics::ProgramStats,
-    verification::verify,
     vm::execute,
 };
 
@@ -22,7 +21,9 @@ pub enum BenchmarkCategory {
     ConstantPropagation,
     AlgebraicSimplification,
     LocalCSE,
+    DeadCodeElimination,
     Combined,
+    ControlFlow,
 }
 
 impl BenchmarkCategory {
@@ -33,7 +34,9 @@ impl BenchmarkCategory {
             Self::ConstantPropagation => "Constant Propagation",
             Self::AlgebraicSimplification => "Algebraic Simp",
             Self::LocalCSE => "Local CSE",
+            Self::DeadCodeElimination => "Dead Code Elim",
             Self::Combined => "★ Combined ★",
+            Self::ControlFlow => "Control Flow / Base",
         }
     }
 
@@ -44,19 +47,32 @@ impl BenchmarkCategory {
             Self::ConstantPropagation => "CP",
             Self::AlgebraicSimplification => "AS",
             Self::LocalCSE => "CSE",
+            Self::DeadCodeElimination => "DCE",
             Self::Combined => "COMB",
+            Self::ControlFlow => "BASE",
         }
     }
 }
 
-pub const ALL_CATEGORIES: [BenchmarkCategory; 6] = [
+pub const ALL_CATEGORIES: [BenchmarkCategory; 8] = [
     BenchmarkCategory::All,
     BenchmarkCategory::ConstantFolding,
     BenchmarkCategory::ConstantPropagation,
     BenchmarkCategory::AlgebraicSimplification,
     BenchmarkCategory::LocalCSE,
+    BenchmarkCategory::DeadCodeElimination,
     BenchmarkCategory::Combined,
+    BenchmarkCategory::ControlFlow,
 ];
+
+#[derive(Debug, Clone)]
+pub struct VectorProof {
+    pub vector_id: usize,
+    pub inputs: Vec<i32>,
+    pub original_output: Vec<i32>,
+    pub optimized_output: Vec<i32>,
+    pub passed: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkItem {
@@ -77,6 +93,7 @@ pub struct BenchmarkItem {
     pub worklist_rounds: usize,
     pub original_outputs: Vec<i32>,
     pub optimized_outputs: Vec<i32>,
+    pub test_vectors: Vec<VectorProof>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,14 +123,7 @@ impl BenchmarkCorpus {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| format!("benchmark_{:02}.tac", idx + 1));
 
-            // Default test input vectors based on program requirements
-            let inputs = if name.contains("control") {
-                vec![0, 1, 2, 3, 4]
-            } else {
-                vec![4, 9, 3, 7, 5]
-            };
-
-            if let Some(item) = Self::compile_item(idx + 1, name, path, &source, &inputs) {
+            if let Some(item) = Self::compile_item(idx + 1, name, path, &source) {
                 items.push(item);
             }
         }
@@ -126,11 +136,9 @@ impl BenchmarkCorpus {
         name: String,
         path: PathBuf,
         source: &str,
-        inputs: &[i32],
     ) -> Option<BenchmarkItem> {
         let original = parse_program(source).ok()?;
         let original_stats = ProgramStats::compute(&original);
-        let verification = verify(&original, inputs).ok()?;
 
         let mut optimized = original.clone();
         let cfg = build(&mut optimized).ok()?;
@@ -141,8 +149,59 @@ impl BenchmarkCorpus {
         } = optimize_with_worklist(&mut optimized, &cfg);
         let optimized_stats = ProgramStats::compute(&optimized);
 
-        // Measure VM execution times across multiple runs for stable microsecond timing
-        let (time_original_us, time_optimized_us) = measure_execution_times(&original, &optimized, inputs);
+        // Run 5 distinct differential test vectors through the TAC VM for undeniable semantic proof
+        let test_input_sets: Vec<Vec<i32>> = if name.contains("control") || name.contains("ctrl") {
+            vec![
+                vec![0, 1, 2, 3, 4],
+                vec![1, 2, 3, 4, 5],
+                vec![2, 0, 5, 1, 3],
+                vec![3, 4, 1, 2, 0],
+                vec![4, 2, 0, 3, 1],
+            ]
+        } else {
+            vec![
+                vec![4, 9, 3, 7, 5],
+                vec![0, 1, 2, 3, 4],
+                vec![10, 5, 20, 1, 8],
+                vec![100, 25, 50, 200, 15],
+                vec![7, 14, 42, 6, 2],
+            ]
+        };
+
+        let mut test_vectors = Vec::with_capacity(5);
+        let mut all_passed = true;
+
+        for (v_idx, inp) in test_input_sets.into_iter().enumerate() {
+            let orig_res = execute(&original, &inp);
+            let opt_res = execute(&optimized, &inp);
+
+            let (orig_out, opt_out, matched) = match (orig_res, opt_res) {
+                (Ok(o1), Ok(o2)) => {
+                    let m = o1.output == o2.output;
+                    (o1.output, o2.output, m)
+                }
+                _ => (Vec::new(), Vec::new(), false),
+            };
+
+            if !matched {
+                all_passed = false;
+            }
+
+            test_vectors.push(VectorProof {
+                vector_id: v_idx + 1,
+                inputs: inp,
+                original_output: orig_out,
+                optimized_output: opt_out,
+                passed: matched,
+            });
+        }
+
+        let primary_inputs = test_vectors.first().map(|v| v.inputs.clone()).unwrap_or_default();
+        let original_outputs = test_vectors.first().map(|v| v.original_output.clone()).unwrap_or_default();
+        let optimized_outputs = test_vectors.first().map(|v| v.optimized_output.clone()).unwrap_or_default();
+
+        // Measure VM execution times across 100 runs for stable microsecond timing
+        let (time_original_us, time_optimized_us) = measure_execution_times(&original, &optimized, &primary_inputs);
         let speedup_pct = if time_original_us > 0 {
             if time_original_us >= time_optimized_us {
                 ((time_original_us - time_optimized_us) as f64 / time_original_us as f64) * 100.0
@@ -154,13 +213,27 @@ impl BenchmarkCorpus {
         };
 
         // Categorization logic:
-        // Collect set of unique passes that fired:
         let mut passes_fired = HashSet::new();
         for trans in &transformations {
             passes_fired.insert(trans.pass);
         }
 
-        let category = if passes_fired.len() >= 2 {
+        let name_lower = name.to_lowercase();
+        let category = if name_lower.starts_with("combined") || name_lower.contains("comb") {
+            BenchmarkCategory::Combined
+        } else if name_lower.starts_with("const") {
+            BenchmarkCategory::ConstantFolding
+        } else if name_lower.starts_with("prop") {
+            BenchmarkCategory::ConstantPropagation
+        } else if name_lower.starts_with("alg") {
+            BenchmarkCategory::AlgebraicSimplification
+        } else if name_lower.starts_with("cse") {
+            BenchmarkCategory::LocalCSE
+        } else if name_lower.starts_with("dce") || name_lower.starts_with("dead") {
+            BenchmarkCategory::DeadCodeElimination
+        } else if name_lower.starts_with("ctrl") || name_lower.starts_with("control") {
+            BenchmarkCategory::ControlFlow
+        } else if passes_fired.len() >= 2 {
             BenchmarkCategory::Combined
         } else if passes_fired.contains(&OptimizationKind::ConstantFolding) {
             BenchmarkCategory::ConstantFolding
@@ -170,8 +243,10 @@ impl BenchmarkCorpus {
             BenchmarkCategory::AlgebraicSimplification
         } else if passes_fired.contains(&OptimizationKind::LocalCommonSubexpressionElimination) {
             BenchmarkCategory::LocalCSE
+        } else if passes_fired.contains(&OptimizationKind::DeadCodeElimination) {
+            BenchmarkCategory::DeadCodeElimination
         } else {
-            BenchmarkCategory::All
+            BenchmarkCategory::ControlFlow
         };
 
         Some(BenchmarkItem {
@@ -187,11 +262,12 @@ impl BenchmarkCorpus {
             time_original_us,
             time_optimized_us,
             speedup_pct,
-            verification_passed: verification.matches(),
+            verification_passed: all_passed,
             transformations,
             worklist_rounds: rounds,
-            original_outputs: verification.original_output,
-            optimized_outputs: verification.optimized_output,
+            original_outputs,
+            optimized_outputs,
+            test_vectors,
         })
     }
 

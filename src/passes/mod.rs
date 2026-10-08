@@ -12,13 +12,15 @@ pub enum OptimizationKind {
     ConstantPropagation,
     AlgebraicSimplification,
     LocalCommonSubexpressionElimination,
+    DeadCodeElimination,
 }
 
-pub const REVIEW_ONE_PASSES: [OptimizationKind; 4] = [
+pub const REVIEW_ONE_PASSES: [OptimizationKind; 5] = [
     OptimizationKind::ConstantFolding,
     OptimizationKind::ConstantPropagation,
     OptimizationKind::AlgebraicSimplification,
     OptimizationKind::LocalCommonSubexpressionElimination,
+    OptimizationKind::DeadCodeElimination,
 ];
 
 const WORKLIST_ROUND_LIMIT: usize = 16;
@@ -69,6 +71,8 @@ pub fn optimize_with_worklist(program: &mut Program, cfg: &ControlFlowGraph) -> 
 
         let cse_transformations = optimize_local_cse(program, cfg);
         if cse_transformations.is_empty() {
+            let dce = eliminate_dead_code(program);
+            transformations.extend(dce);
             return OptimizationReport {
                 transformations,
                 worklist_events,
@@ -88,6 +92,8 @@ pub fn optimize_with_worklist(program: &mut Program, cfg: &ControlFlowGraph) -> 
         }
     }
 
+    let dce = eliminate_dead_code(program);
+    transformations.extend(dce);
     OptimizationReport {
         transformations,
         worklist_events,
@@ -248,8 +254,8 @@ fn simplify_instruction(instruction: &mut Instruction, transformations: &mut Vec
         return;
     }
 
-    if let (Operand::Const(left), Operand::Const(right)) = (&instruction.arg1, &instruction.arg2) {
-        if let Some(result) = evaluate(instruction.op, *left, *right) {
+    if let (Operand::Const(left), Operand::Const(right)) = (&instruction.arg1, &instruction.arg2)
+        && let Some(result) = evaluate(instruction.op, *left, *right) {
             let before = instruction.clone();
             replace_with_assignment(instruction, Operand::Const(result));
             transformations.push(Transformation {
@@ -260,7 +266,6 @@ fn simplify_instruction(instruction: &mut Instruction, transformations: &mut Vec
             });
             return;
         }
-    }
 
     if let Some(replacement) = algebraic_replacement(instruction) {
         let before = instruction.clone();
@@ -404,20 +409,18 @@ impl DefUseChains {
             for instruction_id in &block.instruction_ids {
                 let instruction = instruction_by_id[instruction_id];
                 for operand in used_operands(instruction) {
-                    if let Some(key) = operand_key(operand) {
-                        if let Some(definition_id) = last_definition.get(&key) {
+                    if let Some(key) = operand_key(operand)
+                        && let Some(definition_id) = last_definition.get(&key) {
                             consumers_by_definition
                                 .entry(*definition_id)
                                 .or_insert_with(Vec::new)
                                 .push(*instruction_id);
                         }
-                    }
                 }
-                if defines_destination(instruction) {
-                    if let Some(key) = operand_key(&instruction.dest) {
+                if defines_destination(instruction)
+                    && let Some(key) = operand_key(&instruction.dest) {
                         last_definition.insert(key, *instruction_id);
                     }
-                }
             }
         }
 
@@ -598,3 +601,61 @@ impl ValueNumberState {
 fn is_commutative(operation: OpCode) -> bool {
     matches!(operation, OpCode::Add | OpCode::Mul)
 }
+
+/// Backward sweep: eliminates instructions whose destination temporary/variable is never read downstream.
+pub fn eliminate_dead_code(program: &mut Program) -> Vec<Transformation> {
+    let mut transformations = Vec::new();
+    let mut changed = true;
+
+    while changed {
+        changed = false;
+        let mut used = HashSet::new();
+
+        for inst in &program.instructions {
+            if inst.op == OpCode::Nop {
+                continue;
+            }
+            for op in used_operands(inst) {
+                if let Some(key) = operand_key(op) {
+                    used.insert(key);
+                }
+            }
+        }
+
+        for inst in &mut program.instructions {
+            if inst.op == OpCode::Nop
+                || inst.op == OpCode::Print
+                || inst.op == OpCode::Read
+                || inst.op == OpCode::Goto
+                || inst.op == OpCode::IfFalse
+                || inst.op == OpCode::Label
+            {
+                continue;
+            }
+
+            if defines_destination(inst)
+                && let Some(dest_key) = operand_key(&inst.dest)
+                    && !used.contains(&dest_key) {
+                        let before = inst.clone();
+                        inst.op = OpCode::Nop;
+                        inst.arg1 = Operand::None;
+                        inst.arg2 = Operand::None;
+                        inst.dest = Operand::None;
+                        transformations.push(Transformation {
+                            pass: OptimizationKind::DeadCodeElimination,
+                            instruction_id: inst.id,
+                            before,
+                            after: inst.clone(),
+                        });
+                        changed = true;
+                    }
+        }
+
+        if changed {
+            program.instructions.retain(|inst| inst.op != OpCode::Nop);
+        }
+    }
+
+    transformations
+}
+

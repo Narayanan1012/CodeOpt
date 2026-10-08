@@ -103,6 +103,7 @@ fn render_top_graphs_deck(frame: &mut Frame, app: &App, area: Rect) {
     let mut cp_count = 0;
     let mut as_count = 0;
     let mut cse_count = 0;
+    let mut dce_count = 0;
     let mut total_transforms = 0;
 
     for item in &app.corpus.items {
@@ -113,6 +114,7 @@ fn render_top_graphs_deck(frame: &mut Frame, app: &App, area: Rect) {
                 crate::passes::OptimizationKind::ConstantPropagation => cp_count += 1,
                 crate::passes::OptimizationKind::AlgebraicSimplification => as_count += 1,
                 crate::passes::OptimizationKind::LocalCommonSubexpressionElimination => cse_count += 1,
+                crate::passes::OptimizationKind::DeadCodeElimination => dce_count += 1,
             }
         }
     }
@@ -130,31 +132,36 @@ fn render_top_graphs_deck(frame: &mut Frame, app: &App, area: Rect) {
     let cp_pct = pct(cp_count);
     let as_pct = pct(as_count);
     let cse_pct = pct(cse_count);
+    let dce_pct = pct(dce_count);
 
     let dist_lines = vec![
         Line::from(vec![
             Span::styled("Constant Folding [CF] : ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{cf_count} ({cf_pct:.0}%)  "), Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(gauge_bar(cf_pct, 12), Style::default().fg(COLOR_CYAN)),
+            Span::styled(gauge_bar(cf_pct, 10), Style::default().fg(COLOR_CYAN)),
         ]),
         Line::from(vec![
             Span::styled("Constant Prop    [CP] : ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{cp_count} ({cp_pct:.0}%)  "), Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(gauge_bar(cp_pct, 12), Style::default().fg(COLOR_INDIGO)),
+            Span::styled(gauge_bar(cp_pct, 10), Style::default().fg(COLOR_INDIGO)),
         ]),
         Line::from(vec![
             Span::styled("Algebraic Simp   [AS] : ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{as_count} ({as_pct:.0}%)  "), Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(gauge_bar(as_pct, 12), Style::default().fg(COLOR_SUCCESS)),
+            Span::styled(gauge_bar(as_pct, 10), Style::default().fg(COLOR_SUCCESS)),
         ]),
         Line::from(vec![
             Span::styled("Local CSE        [CSE]: ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{cse_count} ({cse_pct:.0}%)  "), Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(gauge_bar(cse_pct, 12), Style::default().fg(COLOR_WARNING)),
+            Span::styled(gauge_bar(cse_pct, 10), Style::default().fg(COLOR_WARNING)),
         ]),
-        Line::from(""),
         Line::from(vec![
-            Span::styled(format!("Total Transformations: {total_transforms}"), Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled("Dead Code Elim   [DCE]: ", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{dce_count} ({dce_pct:.0}%)  "), Style::default().fg(COLOR_TEXT_HEAD)),
+            Span::styled(gauge_bar(dce_pct, 10), Style::default().fg(COLOR_DANGER)),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("Total Rewrites: {total_transforms}"), Style::default().fg(COLOR_TEXT_MUTED)),
             Span::styled(format!("  │  Net ΔInst: -{inst_pct:.1}%"), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         ]),
     ];
@@ -445,13 +452,15 @@ fn render_program_list(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_footer(frame: &mut Frame, _app: &App, area: Rect) {
     let text = Line::from(vec![
-        Span::styled(" [1-6] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(" [1-8] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         Span::styled("Category  ", Style::default().fg(COLOR_TEXT_BODY)),
-        Span::styled(" [↑/↓ or j/k] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(" [G] ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+        Span::styled("Analytics Deck (6 Plots)  ", Style::default().fg(COLOR_TEXT_BODY)),
+        Span::styled(" [↑/↓] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         Span::styled("Select Program  ", Style::default().fg(COLOR_TEXT_BODY)),
         Span::styled(" [Enter] ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         Span::styled("View More ⤢  ", Style::default().fg(COLOR_TEXT_BODY)),
-        Span::styled(" [/] ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+        Span::styled(" [/] ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
         Span::styled("Search  ", Style::default().fg(COLOR_TEXT_BODY)),
         Span::styled(" [Esc] ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
         Span::styled("Home  ", Style::default().fg(COLOR_TEXT_BODY)),
