@@ -1,7 +1,7 @@
 //! Application state, navigation engine, and event handling for CodeOpt.
 
 use std::fs;
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -16,10 +16,13 @@ use crate::{
     parser::parse_program,
     passes::optimize_with_worklist,
     tui::{
-        data::{BenchmarkCategory, BenchmarkCorpus, BenchmarkItem},
+        data::{
+            measure_execution_times, BenchmarkCategory, BenchmarkCorpus, BenchmarkItem,
+            VectorProof,
+        },
         theme::{
             COLOR_CYAN, COLOR_INDIGO, COLOR_PANEL_BG,
-            COLOR_PINK, COLOR_SUCCESS, COLOR_TEXT_BODY, COLOR_TEXT_MUTED,
+            COLOR_PINK, COLOR_SUCCESS, COLOR_TEXT_BODY, COLOR_TEXT_MUTED, COLOR_WARNING,
         },
         views::{
             render_analytics, render_benchmarks, render_home, render_optimizing,
@@ -40,6 +43,62 @@ pub enum CurrentScreen {
     AnalyticsDeck,
 }
 
+pub fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+pub fn get_clipboard_text() -> Option<String> {
+    if let Ok(output) = std::process::Command::new("wl-paste").output() {
+        if output.status.success() {
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    if let Ok(output) = std::process::Command::new("xsel")
+        .arg("--clipboard")
+        .arg("--output")
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn set_clipboard_text(text: &str) {
+    if let Ok(mut child) = std::process::Command::new("wl-copy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        return;
+    }
+    if let Ok(mut child) = std::process::Command::new("xsel")
+        .arg("--clipboard")
+        .arg("--input")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
 pub struct App {
     pub screen: CurrentScreen,
     pub selected_home_card: usize, // 0: Playground, 1: Benchmark Suite
@@ -56,14 +115,19 @@ pub struct App {
     pub optimizing_progress: usize,
     pub show_optimizing_screen: bool,
 
-    // Step 3: Program Deep Dive Scroll States
+    // Step 3: Program Deep Dive Scroll & Live VM Execution States
     pub code_scroll_offset: usize,
     pub audit_scroll_offset: usize,
+    pub deep_dive_executed: bool,
+    pub deep_dive_orig_time_us: u128,
+    pub deep_dive_opt_time_us: u128,
+    pub deep_dive_vector_results: Vec<VectorProof>,
 
     // Step 3: Interactive Playground State
     pub playground_file_name: String,
     pub playground_buffer: Vec<String>,
     pub playground_cursor_row: usize,
+    pub playground_cursor_col: usize,
     pub playground_editing: bool,
     pub playground_inputs: Vec<i32>,
     pub playground_opt_lines: Vec<String>,
@@ -72,6 +136,9 @@ pub struct App {
     pub playground_orig_out: Vec<i32>,
     pub playground_opt_out: Vec<i32>,
     pub playground_equiv_pass: bool,
+    pub playground_converted: bool,
+    pub playground_vm_executed: bool,
+    pub playground_status_message: Option<String>,
 
     pub load_file_modal_open: bool,
     pub load_file_path_input: String,
@@ -106,10 +173,15 @@ impl App {
 
             code_scroll_offset: 0,
             audit_scroll_offset: 0,
+            deep_dive_executed: false,
+            deep_dive_orig_time_us: 0,
+            deep_dive_opt_time_us: 0,
+            deep_dive_vector_results: Vec::new(),
 
             playground_file_name: "scratchpad.tac".to_string(),
             playground_buffer: default_playground,
             playground_cursor_row: 2,
+            playground_cursor_col: 0,
             playground_editing: false,
             playground_inputs: vec![4, 9],
             playground_opt_lines: Vec::new(),
@@ -118,6 +190,9 @@ impl App {
             playground_orig_out: Vec::new(),
             playground_opt_out: Vec::new(),
             playground_equiv_pass: true,
+            playground_converted: true,
+            playground_vm_executed: true,
+            playground_status_message: None,
 
             load_file_modal_open: false,
             load_file_path_input: "benchmarks/algebraic_01.tac".to_string(),
@@ -138,12 +213,71 @@ impl App {
         }
     }
 
-    pub fn recompile_playground(&mut self) {
+    pub fn run_deep_dive_vm(&mut self) {
+        let Some(item) = self.selected_item() else { return; };
+        let Ok(original) = parse_program(&item.source) else { return; };
+        let mut optimized = original.clone();
+        let Ok(cfg) = build(&mut optimized) else { return; };
+        let _report = optimize_with_worklist(&mut optimized, &cfg);
+
+        let test_input_sets = if item.name.contains("control") || item.name.contains("ctrl") {
+            vec![
+                vec![0, 1, 2, 3, 4],
+                vec![1, 2, 3, 4, 5],
+                vec![2, 0, 5, 1, 3],
+                vec![3, 4, 1, 2, 0],
+                vec![4, 2, 0, 3, 1],
+            ]
+        } else {
+            vec![
+                vec![4, 9, 3, 7, 5],
+                vec![0, 1, 2, 3, 4],
+                vec![10, 5, 20, 1, 8],
+                vec![100, 25, 50, 200, 15],
+                vec![7, 14, 42, 6, 2],
+            ]
+        };
+
+        let mut results = Vec::with_capacity(5);
+        for (idx, inp) in test_input_sets.into_iter().enumerate() {
+            let orig_res = execute(&original, &inp);
+            let opt_res = execute(&optimized, &inp);
+
+            let (orig_out, opt_out, matched) = match (orig_res, opt_res) {
+                (Ok(o1), Ok(o2)) => {
+                    let m = o1.output == o2.output;
+                    (o1.output, o2.output, m)
+                }
+                _ => (Vec::new(), Vec::new(), false),
+            };
+
+            results.push(VectorProof {
+                vector_id: idx + 1,
+                inputs: inp,
+                original_output: orig_out,
+                optimized_output: opt_out,
+                passed: matched,
+            });
+        }
+
+        let primary_inputs = results.first().map(|v| v.inputs.as_slice()).unwrap_or(&[]);
+        let (t_orig, t_opt) = measure_execution_times(&original, &optimized, primary_inputs);
+        self.deep_dive_orig_time_us = t_orig;
+        self.deep_dive_opt_time_us = t_opt;
+        self.deep_dive_vector_results = results;
+        self.deep_dive_executed = true;
+    }
+
+    pub fn convert_playground(&mut self) {
         let source = self.playground_buffer.join("\n");
         let parsed = match parse_program(&source) {
             Ok(p) => p,
             Err(e) => {
                 self.playground_parse_error = Some(e.to_string());
+                self.playground_opt_lines.clear();
+                self.playground_transforms.clear();
+                self.playground_converted = false;
+                self.playground_vm_executed = false;
                 return;
             }
         };
@@ -153,6 +287,10 @@ impl App {
             Ok(c) => c,
             Err(e) => {
                 self.playground_parse_error = Some(e.to_string());
+                self.playground_opt_lines.clear();
+                self.playground_transforms.clear();
+                self.playground_converted = false;
+                self.playground_vm_executed = false;
                 return;
             }
         };
@@ -161,6 +299,22 @@ impl App {
         self.playground_parse_error = None;
         self.playground_opt_lines = optimized.to_string().lines().map(String::from).collect();
         self.playground_transforms = report.transformations;
+        self.playground_converted = true;
+        self.playground_vm_executed = false;
+    }
+
+    pub fn run_playground_vm(&mut self) {
+        if !self.playground_converted {
+            self.convert_playground();
+        }
+        if self.playground_parse_error.is_some() {
+            return;
+        }
+
+        let source = self.playground_buffer.join("\n");
+        let Ok(parsed) = parse_program(&source) else { return; };
+        let opt_source = self.playground_opt_lines.join("\n");
+        let Ok(optimized) = parse_program(&opt_source) else { return; };
 
         // Run differential VM
         let orig_res = execute(&parsed, &self.playground_inputs);
@@ -171,11 +325,83 @@ impl App {
             self.playground_orig_out = o1.output;
             self.playground_opt_out = o2.output;
             self.playground_equiv_pass = matches;
+            self.playground_vm_executed = true;
         } else if let Ok(v) = verify(&parsed, &self.playground_inputs) {
             let matches = v.matches();
             self.playground_orig_out = v.original_output;
             self.playground_opt_out = v.optimized_output;
             self.playground_equiv_pass = matches;
+            self.playground_vm_executed = true;
+        }
+    }
+
+    pub fn recompile_playground(&mut self) {
+        self.convert_playground();
+        self.run_playground_vm();
+    }
+
+    pub fn copy_playground_to_clipboard(&mut self) {
+        let text = self.playground_buffer.join("\n");
+        set_clipboard_text(&text);
+        self.playground_status_message = Some("COPIED TAC BUFFER TO CLIPBOARD".to_string());
+    }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        if self.screen == CurrentScreen::Playground {
+            if self.load_file_modal_open {
+                self.load_file_path_input.push_str(text);
+                return;
+            }
+
+            if self.playground_buffer.is_empty() {
+                self.playground_buffer.push(String::new());
+                self.playground_cursor_row = 0;
+                self.playground_cursor_col = 0;
+            }
+
+            let row = self.playground_cursor_row.min(self.playground_buffer.len().saturating_sub(1));
+            let line_chars = self.playground_buffer[row].chars().count();
+            let col = self.playground_cursor_col.min(line_chars);
+
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            let paste_lines: Vec<&str> = normalized.split('\n').collect();
+
+            if paste_lines.len() == 1 {
+                let single = paste_lines[0];
+                let byte_idx = char_to_byte_idx(&self.playground_buffer[row], col);
+                self.playground_buffer[row].insert_str(byte_idx, single);
+                self.playground_cursor_col = col + single.chars().count();
+            } else {
+                let current_line = &self.playground_buffer[row];
+                let byte_idx = char_to_byte_idx(current_line, col);
+                let prefix = current_line[..byte_idx].to_string();
+                let suffix = current_line[byte_idx..].to_string();
+
+                self.playground_buffer[row] = format!("{}{}", prefix, paste_lines[0]);
+
+                for (idx, line_str) in paste_lines[1..paste_lines.len() - 1].iter().enumerate() {
+                    self.playground_buffer.insert(row + 1 + idx, line_str.to_string());
+                }
+
+                let last_idx = row + paste_lines.len() - 1;
+                let last_content = paste_lines.last().unwrap();
+                let last_str = format!("{}{}", last_content, suffix);
+                self.playground_buffer.insert(last_idx, last_str);
+
+                self.playground_cursor_row = last_idx;
+                self.playground_cursor_col = last_content.chars().count();
+            }
+
+            self.playground_converted = false;
+            self.playground_vm_executed = false;
+            self.playground_status_message = Some("PASTED FROM CLIPBOARD".to_string());
+        } else if self.screen == CurrentScreen::BenchmarkSuite && self.search_active {
+            self.search_query.push_str(text);
+            self.selected_benchmark_idx = 0;
         }
     }
 
@@ -202,6 +428,16 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
+        self.handle_key_with_modifiers(key, KeyModifiers::empty());
+    }
+
+    pub fn handle_key_event(&mut self, key: KeyEvent) {
+        self.handle_key_with_modifiers(key.code, key.modifiers);
+    }
+
+    pub fn handle_key_with_modifiers(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        self.playground_status_message = None;
+
         // Global modal toggle
         if self.help_modal_open {
             match key {
@@ -215,6 +451,12 @@ impl App {
 
         // Search mode handling in benchmark suite
         if self.screen == CurrentScreen::BenchmarkSuite && self.search_active {
+            if modifiers.contains(KeyModifiers::CONTROL) && (key == KeyCode::Char('v') || key == KeyCode::Char('V')) {
+                if let Some(text) = get_clipboard_text() {
+                    self.handle_paste(&text);
+                }
+                return;
+            }
             match key {
                 KeyCode::Esc => {
                     self.search_active = false;
@@ -239,6 +481,12 @@ impl App {
 
         // Load file path modal in playground
         if self.screen == CurrentScreen::Playground && self.load_file_modal_open {
+            if modifiers.contains(KeyModifiers::CONTROL) && (key == KeyCode::Char('v') || key == KeyCode::Char('V')) {
+                if let Some(text) = get_clipboard_text() {
+                    self.handle_paste(&text);
+                }
+                return;
+            }
             match key {
                 KeyCode::Esc => {
                     self.load_file_modal_open = false;
@@ -252,6 +500,7 @@ impl App {
                         self.playground_file_name = path.to_string();
                         self.playground_buffer = content.lines().map(String::from).collect();
                         self.playground_cursor_row = 0;
+                        self.playground_cursor_col = 0;
                         self.recompile_playground();
                     }
                     self.load_file_modal_open = false;
@@ -266,42 +515,172 @@ impl App {
 
         // In-place text editing in playground
         if self.screen == CurrentScreen::Playground && self.playground_editing {
+            if modifiers.contains(KeyModifiers::CONTROL) {
+                match key {
+                    KeyCode::Char('v') | KeyCode::Char('V') => {
+                        if let Some(text) = get_clipboard_text() {
+                            self.handle_paste(&text);
+                        }
+                        return;
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                        self.copy_playground_to_clipboard();
+                        return;
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        self.playground_cursor_col = 0;
+                        return;
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        if let Some(line) = self.playground_buffer.get(self.playground_cursor_row) {
+                            self.playground_cursor_col = line.chars().count();
+                        }
+                        return;
+                    }
+                    KeyCode::Char('k') | KeyCode::Char('K') => {
+                        if self.playground_cursor_row < self.playground_buffer.len() {
+                            let line = &mut self.playground_buffer[self.playground_cursor_row];
+                            let char_count = line.chars().count();
+                            let col = self.playground_cursor_col.min(char_count);
+                            let byte_idx = char_to_byte_idx(line, col);
+                            line.truncate(byte_idx);
+                            self.playground_converted = false;
+                            self.playground_vm_executed = false;
+                        }
+                        return;
+                    }
+                    KeyCode::Char('u') | KeyCode::Char('U') => {
+                        if self.playground_cursor_row < self.playground_buffer.len() {
+                            let line = &mut self.playground_buffer[self.playground_cursor_row];
+                            let char_count = line.chars().count();
+                            let col = self.playground_cursor_col.min(char_count);
+                            let byte_idx = char_to_byte_idx(line, col);
+                            let rem = line[byte_idx..].to_string();
+                            *line = rem;
+                            self.playground_cursor_col = 0;
+                            self.playground_converted = false;
+                            self.playground_vm_executed = false;
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
             match key {
                 KeyCode::Esc => {
                     self.playground_editing = false;
                 }
-                KeyCode::Enter => {
-                    let insert_pos = (self.playground_cursor_row + 1).min(self.playground_buffer.len());
-                    self.playground_buffer.insert(insert_pos, String::new());
-                    self.playground_cursor_row = insert_pos;
-                    self.recompile_playground();
+                KeyCode::Left => {
+                    if self.playground_cursor_col > 0 {
+                        self.playground_cursor_col -= 1;
+                    } else if self.playground_cursor_row > 0 {
+                        self.playground_cursor_row -= 1;
+                        self.playground_cursor_col = self.playground_buffer[self.playground_cursor_row].chars().count();
+                    }
                 }
-                KeyCode::Backspace => {
+                KeyCode::Right => {
                     if self.playground_cursor_row < self.playground_buffer.len() {
-                        if self.playground_buffer[self.playground_cursor_row].is_empty() {
-                            if self.playground_buffer.len() > 1 {
-                                self.playground_buffer.remove(self.playground_cursor_row);
-                                self.playground_cursor_row = self.playground_cursor_row.saturating_sub(1);
-                            }
-                        } else {
-                            self.playground_buffer[self.playground_cursor_row].pop();
+                        let line_chars = self.playground_buffer[self.playground_cursor_row].chars().count();
+                        if self.playground_cursor_col < line_chars {
+                            self.playground_cursor_col += 1;
+                        } else if self.playground_cursor_row + 1 < self.playground_buffer.len() {
+                            self.playground_cursor_row += 1;
+                            self.playground_cursor_col = 0;
                         }
-                        self.recompile_playground();
                     }
                 }
                 KeyCode::Up => {
-                    self.playground_cursor_row = self.playground_cursor_row.saturating_sub(1);
+                    if self.playground_cursor_row > 0 {
+                        self.playground_cursor_row -= 1;
+                        self.playground_cursor_col = self.playground_cursor_col.min(self.playground_buffer[self.playground_cursor_row].chars().count());
+                    }
                 }
                 KeyCode::Down => {
                     if self.playground_cursor_row + 1 < self.playground_buffer.len() {
                         self.playground_cursor_row += 1;
+                        self.playground_cursor_col = self.playground_cursor_col.min(self.playground_buffer[self.playground_cursor_row].chars().count());
                     }
                 }
-                KeyCode::Char(c)
-                    if self.playground_cursor_row < self.playground_buffer.len() => {
-                        self.playground_buffer[self.playground_cursor_row].push(c);
-                        self.recompile_playground();
+                KeyCode::Home => {
+                    self.playground_cursor_col = 0;
+                }
+                KeyCode::End => {
+                    if let Some(line) = self.playground_buffer.get(self.playground_cursor_row) {
+                        self.playground_cursor_col = line.chars().count();
                     }
+                }
+                KeyCode::Enter => {
+                    if self.playground_cursor_row < self.playground_buffer.len() {
+                        let line = &mut self.playground_buffer[self.playground_cursor_row];
+                        let col = self.playground_cursor_col.min(line.chars().count());
+                        let byte_idx = char_to_byte_idx(line, col);
+                        let remainder = line.split_off(byte_idx);
+                        let insert_pos = self.playground_cursor_row + 1;
+                        self.playground_buffer.insert(insert_pos, remainder);
+                        self.playground_cursor_row = insert_pos;
+                        self.playground_cursor_col = 0;
+                        self.playground_converted = false;
+                        self.playground_vm_executed = false;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if self.playground_cursor_row < self.playground_buffer.len() {
+                        let col = self.playground_cursor_col.min(self.playground_buffer[self.playground_cursor_row].chars().count());
+                        if col > 0 {
+                            let line = &mut self.playground_buffer[self.playground_cursor_row];
+                            let byte_start = char_to_byte_idx(line, col - 1);
+                            let byte_end = char_to_byte_idx(line, col);
+                            line.drain(byte_start..byte_end);
+                            self.playground_cursor_col = col - 1;
+                            self.playground_converted = false;
+                            self.playground_vm_executed = false;
+                        } else if self.playground_cursor_row > 0 {
+                            let current_line = self.playground_buffer.remove(self.playground_cursor_row);
+                            self.playground_cursor_row -= 1;
+                            let prev_chars = self.playground_buffer[self.playground_cursor_row].chars().count();
+                            self.playground_buffer[self.playground_cursor_row].push_str(&current_line);
+                            self.playground_cursor_col = prev_chars;
+                            self.playground_converted = false;
+                            self.playground_vm_executed = false;
+                        } else if self.playground_cursor_row == 0 && self.playground_buffer.len() > 1 && self.playground_buffer[0].is_empty() {
+                            self.playground_buffer.remove(0);
+                            self.playground_cursor_col = 0;
+                            self.playground_converted = false;
+                            self.playground_vm_executed = false;
+                        }
+                    }
+                }
+                KeyCode::Delete => {
+                    if self.playground_cursor_row < self.playground_buffer.len() {
+                        let line_chars = self.playground_buffer[self.playground_cursor_row].chars().count();
+                        let col = self.playground_cursor_col.min(line_chars);
+                        if col < line_chars {
+                            let line = &mut self.playground_buffer[self.playground_cursor_row];
+                            let byte_start = char_to_byte_idx(line, col);
+                            let byte_end = char_to_byte_idx(line, col + 1);
+                            line.drain(byte_start..byte_end);
+                            self.playground_converted = false;
+                            self.playground_vm_executed = false;
+                        } else if col == line_chars && self.playground_cursor_row + 1 < self.playground_buffer.len() {
+                            let next_line = self.playground_buffer.remove(self.playground_cursor_row + 1);
+                            self.playground_buffer[self.playground_cursor_row].push_str(&next_line);
+                            self.playground_converted = false;
+                            self.playground_vm_executed = false;
+                        }
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if self.playground_cursor_row < self.playground_buffer.len() {
+                        let line = &mut self.playground_buffer[self.playground_cursor_row];
+                        let col = self.playground_cursor_col.min(line.chars().count());
+                        let byte_idx = char_to_byte_idx(line, col);
+                        line.insert(byte_idx, c);
+                        self.playground_cursor_col = col + 1;
+                        self.playground_converted = false;
+                        self.playground_vm_executed = false;
+                    }
+                }
                 _ => {}
             }
             return;
@@ -406,47 +785,156 @@ impl App {
                         if items_count > 0 => {
                             self.code_scroll_offset = 0;
                             self.audit_scroll_offset = 0;
+                            self.deep_dive_executed = false;
+                            self.deep_dive_orig_time_us = 0;
+                            self.deep_dive_opt_time_us = 0;
+                            self.deep_dive_vector_results.clear();
                             self.screen = CurrentScreen::ProgramDeepDive;
                         }
                     _ => {}
                 }
             }
-            CurrentScreen::Playground => match key {
-                KeyCode::Esc => {
-                    self.screen = CurrentScreen::Home;
-                }
-                KeyCode::Char('i') => {
-                    self.playground_editing = true;
-                }
-                KeyCode::Char('l') | KeyCode::Char('L') => {
-                    self.load_file_modal_open = true;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.playground_cursor_row = self.playground_cursor_row.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if self.playground_cursor_row + 1 < self.playground_buffer.len() {
-                        self.playground_cursor_row += 1;
+            CurrentScreen::Playground => {
+                if modifiers.contains(KeyModifiers::CONTROL) {
+                    match key {
+                        KeyCode::Char('v') | KeyCode::Char('V') => {
+                            if let Some(text) = get_clipboard_text() {
+                                self.handle_paste(&text);
+                            }
+                            return;
+                        }
+                        KeyCode::Char('c') | KeyCode::Char('C') => {
+                            self.copy_playground_to_clipboard();
+                            return;
+                        }
+                        _ => {}
                     }
                 }
-                KeyCode::Char('c') | KeyCode::Char('r') => {
-                    self.playground_buffer = vec![
-                        "read a".to_string(),
-                        "read b".to_string(),
-                        "t1 = a + 0".to_string(),
-                        "t2 = 10 * 20".to_string(),
-                        "t3 = a + b".to_string(),
-                        "t4 = b + a".to_string(),
-                        "print t4".to_string(),
-                    ];
-                    self.playground_cursor_row = 0;
-                    self.recompile_playground();
+
+                match key {
+                    KeyCode::Esc => {
+                        self.screen = CurrentScreen::Home;
+                    }
+                    KeyCode::Char('i') => {
+                        self.playground_editing = true;
+                        if self.playground_cursor_row < self.playground_buffer.len() {
+                            self.playground_cursor_col = self.playground_cursor_col.min(self.playground_buffer[self.playground_cursor_row].chars().count());
+                        }
+                    }
+                    KeyCode::Char('a') => {
+                        self.playground_editing = true;
+                        if self.playground_cursor_row < self.playground_buffer.len() {
+                            let len = self.playground_buffer[self.playground_cursor_row].chars().count();
+                            self.playground_cursor_col = (self.playground_cursor_col + 1).min(len);
+                        }
+                    }
+                    KeyCode::Char('A') => {
+                        self.playground_editing = true;
+                        if self.playground_cursor_row < self.playground_buffer.len() {
+                            self.playground_cursor_col = self.playground_buffer[self.playground_cursor_row].chars().count();
+                        }
+                    }
+                    KeyCode::Char('I') => {
+                        self.playground_editing = true;
+                        self.playground_cursor_col = 0;
+                    }
+                    KeyCode::Char('o') => {
+                        let insert_pos = (self.playground_cursor_row + 1).min(self.playground_buffer.len());
+                        self.playground_buffer.insert(insert_pos, String::new());
+                        self.playground_cursor_row = insert_pos;
+                        self.playground_cursor_col = 0;
+                        self.playground_editing = true;
+                        self.playground_converted = false;
+                        self.playground_vm_executed = false;
+                    }
+                    KeyCode::Char('O') => {
+                        self.playground_buffer.insert(self.playground_cursor_row, String::new());
+                        self.playground_cursor_col = 0;
+                        self.playground_editing = true;
+                        self.playground_converted = false;
+                        self.playground_vm_executed = false;
+                    }
+                    KeyCode::Char('d') => {
+                        if !self.playground_buffer.is_empty() {
+                            self.playground_buffer.remove(self.playground_cursor_row);
+                            if self.playground_buffer.is_empty() {
+                                self.playground_buffer.push(String::new());
+                            }
+                            self.playground_cursor_row = self.playground_cursor_row.min(self.playground_buffer.len() - 1);
+                            self.playground_cursor_col = self.playground_cursor_col.min(self.playground_buffer[self.playground_cursor_row].chars().count());
+                            self.playground_converted = false;
+                            self.playground_vm_executed = false;
+                        }
+                    }
+                    KeyCode::Char('y') => {
+                        self.copy_playground_to_clipboard();
+                    }
+                    KeyCode::Char('p') => {
+                        if let Some(text) = get_clipboard_text() {
+                            self.handle_paste(&text);
+                        }
+                    }
+                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                        self.load_file_modal_open = true;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.playground_cursor_row = self.playground_cursor_row.saturating_sub(1);
+                        if self.playground_cursor_row < self.playground_buffer.len() {
+                            self.playground_cursor_col = self.playground_cursor_col.min(self.playground_buffer[self.playground_cursor_row].chars().count());
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if self.playground_cursor_row + 1 < self.playground_buffer.len() {
+                            self.playground_cursor_row += 1;
+                            self.playground_cursor_col = self.playground_cursor_col.min(self.playground_buffer[self.playground_cursor_row].chars().count());
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        self.playground_cursor_col = self.playground_cursor_col.saturating_sub(1);
+                    }
+                    KeyCode::Right => {
+                        if self.playground_cursor_row < self.playground_buffer.len() {
+                            let len = self.playground_buffer[self.playground_cursor_row].chars().count();
+                            self.playground_cursor_col = (self.playground_cursor_col + 1).min(len);
+                        }
+                    }
+                    KeyCode::Home => {
+                        self.playground_cursor_col = 0;
+                    }
+                    KeyCode::End => {
+                        if self.playground_cursor_row < self.playground_buffer.len() {
+                            self.playground_cursor_col = self.playground_buffer[self.playground_cursor_row].chars().count();
+                        }
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                        self.convert_playground();
+                    }
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        self.run_playground_vm();
+                    }
+                    KeyCode::Char('x') | KeyCode::Char('X') => {
+                        self.playground_buffer = vec![
+                            "read a".to_string(),
+                            "read b".to_string(),
+                            "t1 = a + 0".to_string(),
+                            "t2 = 10 * 20".to_string(),
+                            "t3 = a + b".to_string(),
+                            "t4 = b + a".to_string(),
+                            "print t4".to_string(),
+                        ];
+                        self.playground_cursor_row = 0;
+                        self.playground_cursor_col = 0;
+                        self.recompile_playground();
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             CurrentScreen::ProgramDeepDive => match key {
                 KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
                     self.screen = CurrentScreen::BenchmarkSuite;
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.run_deep_dive_vm();
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.code_scroll_offset = self.code_scroll_offset.saturating_add(1);
@@ -544,8 +1032,8 @@ impl App {
     }
 
     fn render_help_modal(&self, frame: &mut Frame, area: Rect) {
-        let popup_width = 70.min(area.width.saturating_sub(4));
-        let popup_height = 21.min(area.height.saturating_sub(2));
+        let popup_width = 72.min(area.width.saturating_sub(4));
+        let popup_height = 25.min(area.height.saturating_sub(2));
 
         let popup_area = Rect {
             x: (area.width.saturating_sub(popup_width)) / 2,
@@ -575,24 +1063,32 @@ impl App {
                 Span::styled("Launch Benchmark Suite (with optional Optimizing screen)", Style::default().fg(COLOR_TEXT_BODY)),
             ]),
             Line::from(vec![
-                Span::styled(" [O]          ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-                Span::styled("Toggle Optimizing loading screen ON/OFF", Style::default().fg(COLOR_TEXT_BODY)),
-            ]),
-            Line::from(vec![
                 Span::styled(" [Enter]      ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
                 Span::styled("View More: Expand program to full-screen diff inspector", Style::default().fg(COLOR_TEXT_BODY)),
             ]),
             Line::from(vec![
-                Span::styled(" [Esc]        ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
-                Span::styled("Collapse full-screen / Return to previous view / Home", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled(" [R]          ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+                Span::styled("Run Dual VM & Verify Equivalence (Deep Dive & Playground)", Style::default().fg(COLOR_TEXT_BODY)),
+            ]),
+            Line::from(vec![
+                Span::styled(" [C]          ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
+                Span::styled("Convert TAC buffer: Run optimizations & generate audit trail", Style::default().fg(COLOR_TEXT_BODY)),
             ]),
             Line::from(vec![
                 Span::styled(" [i]          ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
-                Span::styled("Enter in-place buffer edit mode in Playground", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("Enter in-place buffer edit mode in Playground (Esc to exit)", Style::default().fg(COLOR_TEXT_BODY)),
+            ]),
+            Line::from(vec![
+                Span::styled(" [X]          ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
+                Span::styled("Reset sample buffer in Playground", Style::default().fg(COLOR_TEXT_BODY)),
             ]),
             Line::from(vec![
                 Span::styled(" [L]          ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
                 Span::styled("Load program file path in Playground", Style::default().fg(COLOR_TEXT_BODY)),
+            ]),
+            Line::from(vec![
+                Span::styled(" [Esc]        ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
+                Span::styled("Collapse full-screen / Return to previous view / Home", Style::default().fg(COLOR_TEXT_BODY)),
             ]),
             Line::from(vec![
                 Span::styled(" [G]          ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
@@ -824,5 +1320,94 @@ mod tests {
         app.handle_key(KeyCode::Char('2'));
         assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
         assert_eq!(app.active_category, BenchmarkCategory::ConstantFolding);
+    }
+
+    #[test]
+    fn test_deep_dive_interactive_vm_run() {
+        let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
+        let mut app = App::new(corpus);
+
+        // Enter BenchmarkSuite
+        app.show_optimizing_screen = false;
+        app.handle_key(KeyCode::Char('2'));
+        assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
+
+        // Open Deep Dive on selected program
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.screen, CurrentScreen::ProgramDeepDive);
+
+        // Verify initial state: not yet executed, awaiting user pressing 'R'
+        assert!(!app.deep_dive_executed);
+        assert!(app.deep_dive_vector_results.is_empty());
+
+        // Press 'r' to execute dual VM live
+        app.handle_key(KeyCode::Char('r'));
+        assert!(app.deep_dive_executed);
+        assert_eq!(app.deep_dive_vector_results.len(), 5);
+        for v in &app.deep_dive_vector_results {
+            assert!(v.passed, "Live VM vector {} should pass", v.vector_id);
+            assert_eq!(v.original_output, v.optimized_output);
+        }
+
+        // Return to BenchmarkSuite and re-enter
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.screen, CurrentScreen::ProgramDeepDive);
+
+        // Verify reset back to awaiting execution
+        assert!(!app.deep_dive_executed);
+        assert!(app.deep_dive_vector_results.is_empty());
+    }
+
+    #[test]
+    fn test_playground_convert_then_run() {
+        let mut app = App::new(BenchmarkCorpus::default());
+        app.screen = CurrentScreen::Playground;
+
+        // Initially scratchpad is converted and executed
+        assert!(app.playground_converted);
+        assert!(app.playground_vm_executed);
+
+        // Enter edit mode at end of buffer (use 'A' on last line via nav, or navigate)
+        // First move cursor to the last line in navigation mode
+        for _ in 0..6 {
+            app.handle_key(KeyCode::Down);
+        }
+        // Enter edit mode with cursor at end of current line
+        app.handle_key(KeyCode::Char('A'));
+        assert!(app.playground_editing);
+
+        // Press Enter to create new empty line, then type a new instruction
+        app.handle_key(KeyCode::Enter);
+        for ch in "t5 = 4 + 4".chars() {
+            app.handle_key(KeyCode::Char(ch));
+        }
+
+        // In edit mode, typing marks converted and vm_executed as false without re-running compiler
+        assert!(!app.playground_converted);
+        assert!(!app.playground_vm_executed);
+
+        // Exit edit mode
+        app.handle_key(KeyCode::Esc);
+        assert!(!app.playground_editing);
+
+        // Press 'C' to convert and optimize
+        app.handle_key(KeyCode::Char('c'));
+        assert!(app.playground_converted);
+        assert!(!app.playground_vm_executed);
+        assert!(!app.playground_opt_lines.is_empty());
+
+        // Press 'R' to run both codes in dual VM and verify
+        app.handle_key(KeyCode::Char('r'));
+        assert!(app.playground_vm_executed);
+        assert!(app.playground_equiv_pass);
+        assert_eq!(app.playground_orig_out, app.playground_opt_out);
+
+        // Press 'X' to reset back to default
+        app.handle_key(KeyCode::Char('x'));
+        assert!(app.playground_converted);
+        assert!(app.playground_vm_executed);
+        assert_eq!(app.playground_buffer.len(), 7);
     }
 }

@@ -36,13 +36,13 @@ pub fn render_program_modal(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
-    render_header(frame, item, chunks[0]);
+    render_header(frame, app, item, chunks[0]);
     render_code_diff_panes(frame, app, item, chunks[1]);
     render_bottom_split(frame, app, item, chunks[2]);
     render_modal_footer(frame, chunks[3]);
 }
 
-fn render_header(frame: &mut Frame, item: &crate::tui::data::BenchmarkItem, area: Rect) {
+fn render_header(frame: &mut Frame, app: &App, item: &crate::tui::data::BenchmarkItem, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -52,10 +52,15 @@ fn render_header(frame: &mut Frame, item: &crate::tui::data::BenchmarkItem, area
             Span::styled(format!("— {} ", item.name), Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
         ]));
 
-    let pass_badge = if item.verification_passed {
-        Span::styled(" [✓ 100% PASS: 5/5 TEST VECTORS MATCHED] ", Style::default().fg(Color::Rgb(15, 23, 42)).bg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
+    let pass_badge = if !app.deep_dive_executed {
+        Span::styled(" [● AWAITING RUN — PRESS 'R' TO EXECUTE DUAL VM] ", Style::default().fg(Color::Rgb(15, 23, 42)).bg(COLOR_WARNING).add_modifier(Modifier::BOLD))
     } else {
-        Span::styled(" [✗ VERIFICATION MISMATCH] ", Style::default().fg(Color::Rgb(15, 23, 42)).bg(COLOR_DANGER).add_modifier(Modifier::BOLD))
+        let all_passed = !app.deep_dive_vector_results.is_empty() && app.deep_dive_vector_results.iter().all(|v| v.passed);
+        if all_passed {
+            Span::styled(" [✓ LIVE VM VERIFIED: 5/5 TEST VECTORS MATCHED] ", Style::default().fg(Color::Rgb(15, 23, 42)).bg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(" [✗ VERIFICATION MISMATCH] ", Style::default().fg(Color::Rgb(15, 23, 42)).bg(COLOR_DANGER).add_modifier(Modifier::BOLD))
+        }
     };
 
     let category_badge = if item.category == crate::tui::data::BenchmarkCategory::Combined {
@@ -239,10 +244,28 @@ fn render_bottom_split(
     let temp_red = ProgramStats::reduction_pct(item.original_stats.temp_count, item.optimized_stats.temp_count);
     let size_red = ProgramStats::reduction_pct(item.original_stats.code_size_bytes, item.optimized_stats.code_size_bytes);
 
-    let speedup_x = if item.speedup_pct > 0.0 {
-        1.0 / (1.0 - (item.speedup_pct / 100.0).min(0.99))
+    let timing_line = if !app.deep_dive_executed {
+        Line::from(vec![
+            Span::styled(" VM Execution Timing:  ", Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
+            Span::styled("[Pending Execution — Press 'R' to Benchmark Dual VM]", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
+        ])
     } else {
-        1.0
+        let speedup_pct = if app.deep_dive_orig_time_us > 0 {
+            ((app.deep_dive_orig_time_us as f64 - app.deep_dive_opt_time_us as f64) / app.deep_dive_orig_time_us as f64) * 100.0
+        } else {
+            0.0
+        };
+        let speedup_x = if speedup_pct > 0.0 {
+            1.0 / (1.0 - (speedup_pct / 100.0).min(0.99))
+        } else {
+            1.0
+        };
+
+        Line::from(vec![
+            Span::styled(" VM Execution Timing:  ", Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{}µs → {}µs  ", app.deep_dive_orig_time_us, app.deep_dive_opt_time_us), Style::default().fg(COLOR_TEXT_HEAD)),
+            Span::styled(format!("({:+.1}% time | {:.2}x speedup)", speedup_pct, speedup_x), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+        ])
     };
 
     let stats_lines = vec![
@@ -264,28 +287,64 @@ fn render_bottom_split(
             Span::styled(format!("{} → {} ", item.original_stats.temp_count, item.optimized_stats.temp_count), Style::default().fg(COLOR_TEXT_BODY)),
             Span::styled(format!("(-{temp_red:.1}%)"), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(vec![
-            Span::styled(" VM Execution Timing:  ", Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{}µs → {}µs  ", item.time_original_us, item.time_optimized_us), Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(format!("({:+.1}% time | {:.2}x speedup)", item.speedup_pct, speedup_x), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
-        ]),
+        timing_line,
     ];
 
     let stats_widget = Paragraph::new(stats_lines).block(stats_block);
     frame.render_widget(stats_widget, right_splits[0]);
 
     // 5-Vector Dual VM Semantic Equivalence Proof Table
-    let proof_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(if item.verification_passed {
-            Style::default().fg(COLOR_SUCCESS)
-        } else {
-            Style::default().fg(COLOR_DANGER)
-        })
-        .title(Line::from(vec![
-            Span::styled(" Dual VM Semantic Equivalence Proof (5 Test Vectors Executed) ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
-        ]));
+    let (proof_block, rows) = if !app.deep_dive_executed {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(COLOR_WARNING))
+            .title(Line::from(vec![
+                Span::styled(" Dual VM Semantic Equivalence Proof (Press [R] to Run 5 Test Vectors) ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
+            ]));
+
+        let rows: Vec<Row> = item.test_vectors.iter().map(|v| {
+            Row::new(vec![
+                Cell::from(format!("#{}", v.vector_id)).style(Style::default().fg(COLOR_TEXT_MUTED)),
+                Cell::from(format!("{:?}", v.inputs)).style(Style::default().fg(COLOR_TEXT_BODY)),
+                Cell::from("[Pending Run — Press 'R']").style(Style::default().fg(COLOR_TEXT_MUTED)),
+                Cell::from("[Pending Run — Press 'R']").style(Style::default().fg(COLOR_TEXT_MUTED)),
+                Cell::from("[READY TO RUN]").style(Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
+            ])
+        }).collect();
+
+        (block, rows)
+    } else {
+        let all_passed = !app.deep_dive_vector_results.is_empty() && app.deep_dive_vector_results.iter().all(|v| v.passed);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(if all_passed {
+                Style::default().fg(COLOR_SUCCESS)
+            } else {
+                Style::default().fg(COLOR_DANGER)
+            })
+            .title(Line::from(vec![
+                Span::styled(" Dual VM Semantic Equivalence Proof (Live 5 Test Vectors Executed) ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+            ]));
+
+        let rows: Vec<Row> = app.deep_dive_vector_results.iter().map(|v| {
+            let status_cell = if v.passed {
+                Cell::from("✓ PASS (100% IDENTICAL)").style(Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
+            } else {
+                Cell::from("✗ MISMATCH").style(Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))
+            };
+            Row::new(vec![
+                Cell::from(format!("#{}", v.vector_id)).style(Style::default().fg(COLOR_TEXT_MUTED)),
+                Cell::from(format!("{:?}", v.inputs)).style(Style::default().fg(COLOR_TEXT_BODY)),
+                Cell::from(format!("{:?}", v.original_output)).style(Style::default().fg(COLOR_INDIGO)),
+                Cell::from(format!("{:?}", v.optimized_output)).style(Style::default().fg(COLOR_SUCCESS)),
+                status_cell,
+            ])
+        }).collect();
+
+        (block, rows)
+    };
 
     let header = Row::new(vec![
         Cell::from("Vec #").style(Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
@@ -295,21 +354,6 @@ fn render_bottom_split(
         Cell::from("Equivalence Verdict").style(Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
     ])
     .style(Style::default().bg(crate::tui::theme::COLOR_PANEL_BG));
-
-    let rows: Vec<Row> = item.test_vectors.iter().map(|v| {
-        let status_cell = if v.passed {
-            Cell::from("✓ PASS (100% IDENTICAL)").style(Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
-        } else {
-            Cell::from("✗ MISMATCH").style(Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))
-        };
-        Row::new(vec![
-            Cell::from(format!("#{}", v.vector_id)).style(Style::default().fg(COLOR_TEXT_MUTED)),
-            Cell::from(format!("{:?}", v.inputs)).style(Style::default().fg(COLOR_TEXT_BODY)),
-            Cell::from(format!("{:?}", v.original_output)).style(Style::default().fg(COLOR_INDIGO)),
-            Cell::from(format!("{:?}", v.optimized_output)).style(Style::default().fg(COLOR_SUCCESS)),
-            status_cell,
-        ])
-    }).collect();
 
     let widths = [
         Constraint::Length(6),
@@ -327,6 +371,8 @@ fn render_bottom_split(
 
 fn render_modal_footer(frame: &mut Frame, area: Rect) {
     let text = Line::from(vec![
+        Span::styled(" [R] ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+        Span::styled("Run Dual VM & Verify  ", Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
         Span::styled(" [Esc / Backspace] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         Span::styled("Collapse Full-Screen & Return  ", Style::default().fg(COLOR_TEXT_BODY)),
         Span::styled(" [j / k or ↓ / ↑] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),

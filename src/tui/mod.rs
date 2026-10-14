@@ -84,7 +84,7 @@ pub fn build_demo(source: &str, inputs: &[i32]) -> Result<DemoData, String> {
 pub fn run_workbench(corpus: BenchmarkCorpus) -> io::Result<()> {
     enable_raw_mode()?;
     let mut output = stdout();
-    execute!(output, EnterAlternateScreen)?;
+    execute!(output, EnterAlternateScreen, event::EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(output);
     let mut terminal = Terminal::new(backend)?;
 
@@ -92,7 +92,7 @@ pub fn run_workbench(corpus: BenchmarkCorpus) -> io::Result<()> {
     let result = event_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), event::DisableBracketedPaste, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
 }
@@ -115,15 +115,17 @@ fn event_loop(
             continue;
         }
 
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-
-        if key.kind != KeyEventKind::Press {
-            continue;
+        match event::read()? {
+            Event::Key(key) => {
+                if key.kind == KeyEventKind::Press {
+                    app.handle_key_event(key);
+                }
+            }
+            Event::Paste(text) => {
+                app.handle_paste(&text);
+            }
+            _ => {}
         }
-
-        app.handle_key(key.code);
 
         if app.should_quit {
             return Ok(());

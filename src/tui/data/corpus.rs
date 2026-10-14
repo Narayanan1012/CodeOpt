@@ -280,7 +280,7 @@ impl BenchmarkCorpus {
     }
 }
 
-fn measure_execution_times(
+pub fn measure_execution_times(
     original: &crate::ir::Program,
     optimized: &crate::ir::Program,
     inputs: &[i32],

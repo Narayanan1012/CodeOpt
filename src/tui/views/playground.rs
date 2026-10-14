@@ -48,19 +48,27 @@ fn render_playground_header(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(format!("— Source: {} ", app.playground_file_name), Style::default().fg(COLOR_TEXT_HEAD)),
         ]));
 
-    let line = Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(" Live Editor & Real-Time Optimizer  ", Style::default().fg(COLOR_TEXT_MUTED)),
         Span::styled(" │ Mode: ", Style::default().fg(COLOR_TEXT_MUTED)),
-        Span::styled(if app.playground_editing { "EDITING [Type In-Place]" } else { "NAVIGATION [Press 'i' to edit]" }, Style::default().fg(if app.playground_editing { COLOR_SUCCESS } else { COLOR_CYAN }).add_modifier(Modifier::BOLD)),
-        Span::styled(" │ Inputs: ", Style::default().fg(COLOR_TEXT_MUTED)),
-        Span::styled(format!("{:?} ", app.playground_inputs), Style::default().fg(COLOR_PINK)),
+        Span::styled(if app.playground_editing { "EDITING" } else { "NAV" }, Style::default().fg(if app.playground_editing { COLOR_SUCCESS } else { COLOR_CYAN }).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" Ln:{} Col:{}", app.playground_cursor_row + 1, app.playground_cursor_col + 1), Style::default().fg(COLOR_TEXT_MUTED)),
         Span::styled(" │ Status: ", Style::default().fg(COLOR_TEXT_MUTED)),
         if app.playground_parse_error.is_some() {
             Span::styled("SYNTAX ERROR", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))
+        } else if !app.playground_converted {
+            Span::styled("MODIFIED — [C] CONVERT", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD))
+        } else if !app.playground_vm_executed {
+            Span::styled("CONVERTED — [R] RUN VM", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD))
         } else {
-            Span::styled("OPTIMIZATION CONVERGED", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
+            Span::styled("OPTIMIZED & VERIFIED", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
         },
-    ]);
+    ];
+    if let Some(msg) = &app.playground_status_message {
+        header_spans.push(Span::styled(" │ ", Style::default().fg(COLOR_TEXT_MUTED)));
+        header_spans.push(Span::styled(msg, Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)));
+    }
+    let line = Line::from(header_spans);
 
     let widget = Paragraph::new(line).block(block);
     frame.render_widget(widget, area);
@@ -94,17 +102,46 @@ fn render_playground_editor(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Span::raw("  ")
             };
+            let line_num = Span::styled(format!("{:>2}: ", idx + 1), Style::default().fg(COLOR_TEXT_MUTED));
 
-            Line::from(vec![
-                cursor_prefix,
-                Span::styled(format!("{:>2}: ", idx + 1), Style::default().fg(COLOR_TEXT_MUTED)),
-                Span::styled(line, Style::default().fg(if is_cursor_line { COLOR_TEXT_HEAD } else { COLOR_TEXT_BODY })),
-                if is_cursor_line && app.playground_editing {
-                    Span::styled("█", Style::default().fg(COLOR_CYAN))
-                } else {
-                    Span::raw("")
-                },
-            ])
+            if is_cursor_line && app.playground_editing {
+                let char_count = line.chars().count();
+                let col = app.playground_cursor_col.min(char_count);
+                let before: String = line.chars().take(col).collect();
+                let cursor_ch: String = line.chars().skip(col).take(1).collect();
+                let after: String = line.chars().skip(col + 1).collect();
+                let cursor_display = if cursor_ch.is_empty() { " ".to_string() } else { cursor_ch };
+                Line::from(vec![
+                    cursor_prefix,
+                    line_num,
+                    Span::styled(before, Style::default().fg(COLOR_TEXT_HEAD)),
+                    Span::styled(cursor_display, Style::default().fg(COLOR_PANEL_BG).bg(COLOR_CYAN)),
+                    Span::styled(after, Style::default().fg(COLOR_TEXT_HEAD)),
+                ])
+            } else {
+                let mut spans = vec![
+                    cursor_prefix,
+                    line_num,
+                    Span::styled(line, Style::default().fg(if is_cursor_line { COLOR_TEXT_HEAD } else { COLOR_TEXT_BODY })),
+                ];
+                if is_cursor_line && !app.playground_editing {
+                    // Show a dim underline cursor in nav mode
+                    let char_count = line.chars().count();
+                    let col = app.playground_cursor_col.min(char_count);
+                    // Rebuild with cursor highlight for nav mode too
+                    spans.clear();
+                    let before: String = line.chars().take(col).collect();
+                    let cursor_ch: String = line.chars().skip(col).take(1).collect();
+                    let after: String = line.chars().skip(col + 1).collect();
+                    let cursor_display = if cursor_ch.is_empty() { " ".to_string() } else { cursor_ch };
+                    spans.push(Span::styled("▶ ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)));
+                    spans.push(Span::styled(format!("{:>2}: ", idx + 1), Style::default().fg(COLOR_TEXT_MUTED)));
+                    spans.push(Span::styled(before, Style::default().fg(COLOR_TEXT_HEAD)));
+                    spans.push(Span::styled(cursor_display, Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::UNDERLINED)));
+                    spans.push(Span::styled(after, Style::default().fg(COLOR_TEXT_HEAD)));
+                }
+                Line::from(spans)
+            }
         })
         .collect();
 
@@ -136,6 +173,14 @@ fn render_playground_editor(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(Span::styled("  print t1", Style::default().fg(COLOR_TEXT_BODY))),
         ];
         Paragraph::new(err_lines).block(opt_block)
+    } else if !app.playground_converted {
+        let pending_lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(" [Buffer Modified] ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(Span::styled(" Press [C] to run optimization pipeline and generate optimized TAC.", Style::default().fg(COLOR_TEXT_BODY))),
+        ];
+        Paragraph::new(pending_lines).block(opt_block)
     } else {
         let opt_lines: Vec<Line> = app
             .playground_opt_lines
@@ -171,7 +216,9 @@ fn render_playground_bottom(frame: &mut Frame, app: &App, area: Rect) {
         ]));
 
     let mut rewrite_lines = Vec::new();
-    if app.playground_transforms.is_empty() {
+    if !app.playground_converted {
+        rewrite_lines.push(Line::from(Span::styled("Press [C] to convert code and generate transformation trail.", Style::default().fg(COLOR_WARNING))));
+    } else if app.playground_transforms.is_empty() {
         rewrite_lines.push(Line::from(Span::styled("No transformations needed for current code.", Style::default().fg(COLOR_TEXT_MUTED))));
     } else {
         for (idx, t) in app.playground_transforms.iter().enumerate() {
@@ -194,30 +241,53 @@ fn render_playground_bottom(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" Dual VM Execution Console ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         ]));
 
-    let vm_lines = vec![
-        Line::from(vec![
-            Span::styled(" Test Inputs:       ", Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(format!("{:?}", app.playground_inputs), Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled(" Original Output:   ", Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(format!("{:?}", app.playground_orig_out), Style::default().fg(COLOR_TEXT_BODY)),
-        ]),
-        Line::from(vec![
-            Span::styled(" Optimized Output:  ", Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(format!("{:?}", app.playground_opt_out), Style::default().fg(COLOR_TEXT_BODY)),
-        ]),
-        Line::from(vec![
-            Span::styled(" Equivalence Check: ", Style::default().fg(COLOR_TEXT_HEAD)),
-            if app.playground_equiv_pass {
-                Span::styled("[✓ PASS: 100% OUTPUT MATCH]", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
-            } else {
-                Span::styled("[✗ FAIL: OUTPUT DIFFERENCE]", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))
-            },
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("Press [i] to Edit Buffer   [L] Load File Path   [Ctrl+L] Clear", Style::default().fg(COLOR_TEXT_MUTED))),
-    ];
+    let vm_lines = if !app.playground_vm_executed {
+        vec![
+            Line::from(vec![
+                Span::styled(" Test Inputs:       ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled(format!("{:?}", app.playground_inputs), Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Original Output:   ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled("[Pending Run — Press 'R']", Style::default().fg(COLOR_TEXT_MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Optimized Output:  ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled("[Pending Run — Press 'R']", Style::default().fg(COLOR_TEXT_MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Equivalence Check: ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled("[READY — PRESS 'R' TO RUN DUAL VM & VERIFY]", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Press [i] Edit  [C] Convert  [R] Run VM  [L] Load  [X] Reset", Style::default().fg(COLOR_TEXT_MUTED))),
+        ]
+    } else {
+        vec![
+            Line::from(vec![
+                Span::styled(" Test Inputs:       ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled(format!("{:?}", app.playground_inputs), Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Original Output:   ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled(format!("{:?}", app.playground_orig_out), Style::default().fg(COLOR_TEXT_BODY)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Optimized Output:  ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled(format!("{:?}", app.playground_opt_out), Style::default().fg(COLOR_TEXT_BODY)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Equivalence Check: ", Style::default().fg(COLOR_TEXT_HEAD)),
+                if app.playground_equiv_pass {
+                    Span::styled("[✓ PASS: 100% OUTPUT MATCH]", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::styled("[✗ FAIL: OUTPUT DIFFERENCE]", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))
+                },
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Press [i] Edit  [C] Convert  [R] Run VM  [L] Load  [X] Reset", Style::default().fg(COLOR_TEXT_MUTED))),
+        ]
+    };
 
     let vm_widget = Paragraph::new(vm_lines).block(vm_block);
     frame.render_widget(vm_widget, columns[1]);
@@ -227,13 +297,15 @@ fn render_playground_footer(frame: &mut Frame, area: Rect) {
     let text = Line::from(vec![
         Span::styled(" [i] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         Span::styled("Edit Buffer  ", Style::default().fg(COLOR_TEXT_BODY)),
+        Span::styled(" [C] ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
+        Span::styled("Convert & Optimize  ", Style::default().fg(COLOR_TEXT_BODY)),
+        Span::styled(" [R] ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+        Span::styled("Run Dual VM & Verify  ", Style::default().fg(COLOR_TEXT_BODY)),
         Span::styled(" [Esc] ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
         Span::styled("Exit Edit / Home  ", Style::default().fg(COLOR_TEXT_BODY)),
         Span::styled(" [L] ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-        Span::styled("Load File Path  ", Style::default().fg(COLOR_TEXT_BODY)),
-        Span::styled(" [↑/↓] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("Move Cursor  ", Style::default().fg(COLOR_TEXT_BODY)),
-        Span::styled(" [Ctrl+L] ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
+        Span::styled("Load File  ", Style::default().fg(COLOR_TEXT_BODY)),
+        Span::styled(" [X] ", Style::default().fg(COLOR_TEXT_MUTED).add_modifier(Modifier::BOLD)),
         Span::styled("Reset Code  ", Style::default().fg(COLOR_TEXT_BODY)),
         Span::styled(" [Q] ", Style::default().fg(COLOR_TEXT_MUTED).add_modifier(Modifier::BOLD)),
         Span::styled("Quit", Style::default().fg(COLOR_TEXT_MUTED)),
