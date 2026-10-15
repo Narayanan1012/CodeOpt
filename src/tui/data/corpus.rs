@@ -22,6 +22,7 @@ pub enum BenchmarkCategory {
     AlgebraicSimplification,
     LocalCSE,
     DeadCodeElimination,
+    StrengthReduction,
     Combined,
     ControlFlow,
 }
@@ -35,6 +36,7 @@ impl BenchmarkCategory {
             Self::AlgebraicSimplification => "Algebraic Simp",
             Self::LocalCSE => "Local CSE",
             Self::DeadCodeElimination => "Dead Code Elim",
+            Self::StrengthReduction => "Strength Reduction",
             Self::Combined => "★ Combined ★",
             Self::ControlFlow => "Control Flow / Base",
         }
@@ -48,19 +50,21 @@ impl BenchmarkCategory {
             Self::AlgebraicSimplification => "AS",
             Self::LocalCSE => "CSE",
             Self::DeadCodeElimination => "DCE",
+            Self::StrengthReduction => "SR",
             Self::Combined => "COMB",
             Self::ControlFlow => "BASE",
         }
     }
 }
 
-pub const ALL_CATEGORIES: [BenchmarkCategory; 8] = [
+pub const ALL_CATEGORIES: [BenchmarkCategory; 9] = [
     BenchmarkCategory::All,
     BenchmarkCategory::ConstantFolding,
     BenchmarkCategory::ConstantPropagation,
     BenchmarkCategory::AlgebraicSimplification,
     BenchmarkCategory::LocalCSE,
     BenchmarkCategory::DeadCodeElimination,
+    BenchmarkCategory::StrengthReduction,
     BenchmarkCategory::Combined,
     BenchmarkCategory::ControlFlow,
 ];
@@ -231,6 +235,8 @@ impl BenchmarkCorpus {
             BenchmarkCategory::LocalCSE
         } else if name_lower.starts_with("dce") || name_lower.starts_with("dead") {
             BenchmarkCategory::DeadCodeElimination
+        } else if name_lower.starts_with("sr") || name_lower.starts_with("strength") {
+            BenchmarkCategory::StrengthReduction
         } else if name_lower.starts_with("ctrl") || name_lower.starts_with("control") {
             BenchmarkCategory::ControlFlow
         } else if passes_fired.len() >= 2 {
@@ -245,6 +251,8 @@ impl BenchmarkCorpus {
             BenchmarkCategory::LocalCSE
         } else if passes_fired.contains(&OptimizationKind::DeadCodeElimination) {
             BenchmarkCategory::DeadCodeElimination
+        } else if passes_fired.contains(&OptimizationKind::StrengthReduction) {
+            BenchmarkCategory::StrengthReduction
         } else {
             BenchmarkCategory::ControlFlow
         };

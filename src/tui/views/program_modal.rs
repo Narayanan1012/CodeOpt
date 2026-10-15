@@ -53,7 +53,7 @@ fn render_header(frame: &mut Frame, app: &App, item: &crate::tui::data::Benchmar
         ]));
 
     let pass_badge = if !app.deep_dive_executed {
-        Span::styled(" [● AWAITING RUN — PRESS 'R' TO EXECUTE DUAL VM] ", Style::default().fg(Color::Rgb(15, 23, 42)).bg(COLOR_WARNING).add_modifier(Modifier::BOLD))
+        Span::styled(" [• AWAITING RUN — PRESS 'R' TO EXECUTE DUAL VM] ", Style::default().fg(Color::Rgb(15, 23, 42)).bg(COLOR_WARNING).add_modifier(Modifier::BOLD))
     } else {
         let all_passed = !app.deep_dive_vector_results.is_empty() && app.deep_dive_vector_results.iter().all(|v| v.passed);
         if all_passed {
@@ -72,7 +72,7 @@ fn render_header(frame: &mut Frame, app: &App, item: &crate::tui::data::Benchmar
     let header_line = Line::from(vec![
         Span::styled(format!(" Path: {}  ", item.path.display()), Style::default().fg(COLOR_TEXT_MUTED)),
         category_badge,
-        Span::styled(format!(" │ Worklist: Fixed point in {} round(s) │ ", item.worklist_rounds), Style::default().fg(COLOR_TEXT_BODY)),
+        Span::styled(format!(" | Worklist: Fixed point in {} round(s) | ", item.worklist_rounds), Style::default().fg(COLOR_TEXT_BODY)),
         pass_badge,
     ]);
 
@@ -153,6 +153,9 @@ fn render_code_diff_panes(
                     crate::passes::OptimizationKind::DeadCodeElimination => {
                         Span::styled("[DCE] ", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))
                     }
+                    crate::passes::OptimizationKind::StrengthReduction => {
+                        Span::styled("[SR]  ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD))
+                    }
                 }
             } else {
                 Span::raw("      ")
@@ -201,6 +204,7 @@ fn render_bottom_split(
             let pass_name = format!("{:?}", change.pass);
             let before_str = change.before.to_string();
             let after_str = change.after.to_string();
+
             audit_lines.push(Line::from(vec![
                 Span::styled(format!(" #{:02} [{pass_name}] ", idx + 1), Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("Inst #{} ", change.instruction_id), Style::default().fg(COLOR_TEXT_MUTED)),
@@ -260,10 +264,9 @@ fn render_bottom_split(
         } else {
             1.0
         };
-
         Line::from(vec![
             Span::styled(" VM Execution Timing:  ", Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{}µs → {}µs  ", app.deep_dive_orig_time_us, app.deep_dive_opt_time_us), Style::default().fg(COLOR_TEXT_HEAD)),
+            Span::styled(format!("{}µs -> {}µs ", app.deep_dive_orig_time_us, app.deep_dive_opt_time_us), Style::default().fg(COLOR_TEXT_HEAD)),
             Span::styled(format!("({:+.1}% time | {:.2}x speedup)", speedup_pct, speedup_x), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         ])
     };
@@ -271,20 +274,20 @@ fn render_bottom_split(
     let stats_lines = vec![
         Line::from(vec![
             Span::styled(" Instruction Count:    ", Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(format!("{} → {} ", item.original_stats.instruction_count, item.optimized_stats.instruction_count), Style::default().fg(COLOR_TEXT_BODY)),
+            Span::styled(format!("{} -> {} ", item.original_stats.instruction_count, item.optimized_stats.instruction_count), Style::default().fg(COLOR_TEXT_BODY)),
             Span::styled(format!("(-{inst_red:.1}%) "), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
-            Span::styled("[Target: 20–50%]", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled("   │ TAC Code Size: ", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled(format!("{}B → {}B ", item.original_stats.code_size_bytes, item.optimized_stats.code_size_bytes), Style::default().fg(COLOR_TEXT_BODY)),
+            Span::styled("[Target: 20-50%]", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled("   | TAC Code Size: ", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled(format!("{}B -> {}B ", item.original_stats.code_size_bytes, item.optimized_stats.code_size_bytes), Style::default().fg(COLOR_TEXT_BODY)),
             Span::styled(format!("(-{size_red:.1}%)"), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
             Span::styled(" Arithmetic Operations:", Style::default().fg(COLOR_TEXT_HEAD)),
-            Span::styled(format!("{} → {} ", item.original_stats.arithmetic_count, item.optimized_stats.arithmetic_count), Style::default().fg(COLOR_TEXT_BODY)),
+            Span::styled(format!("{} -> {} ", item.original_stats.arithmetic_count, item.optimized_stats.arithmetic_count), Style::default().fg(COLOR_TEXT_BODY)),
             Span::styled(format!("(-{arith_red:.1}%) "), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
-            Span::styled("[Target: 30–60%]", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled("   │ Temporaries  : ", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled(format!("{} → {} ", item.original_stats.temp_count, item.optimized_stats.temp_count), Style::default().fg(COLOR_TEXT_BODY)),
+            Span::styled("[Target: 30-60%]", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled("   | Temporaries  : ", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled(format!("{} -> {} ", item.original_stats.temp_count, item.optimized_stats.temp_count), Style::default().fg(COLOR_TEXT_BODY)),
             Span::styled(format!("(-{temp_red:.1}%)"), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         ]),
         timing_line,
@@ -312,7 +315,6 @@ fn render_bottom_split(
                 Cell::from("[READY TO RUN]").style(Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
             ])
         }).collect();
-
         (block, rows)
     } else {
         let all_passed = !app.deep_dive_vector_results.is_empty() && app.deep_dive_vector_results.iter().all(|v| v.passed);
@@ -342,7 +344,6 @@ fn render_bottom_split(
                 status_cell,
             ])
         }).collect();
-
         (block, rows)
     };
 
@@ -375,14 +376,13 @@ fn render_modal_footer(frame: &mut Frame, area: Rect) {
         Span::styled("Run Dual VM & Verify  ", Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
         Span::styled(" [Esc / Backspace] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         Span::styled("Collapse Full-Screen & Return  ", Style::default().fg(COLOR_TEXT_BODY)),
-        Span::styled(" [j / k or ↓ / ↑] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(" [j / k or ↑↓] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         Span::styled("Scroll Code Diff  ", Style::default().fg(COLOR_TEXT_BODY)),
         Span::styled(" [Tab] ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
         Span::styled("Scroll Audit Trail  ", Style::default().fg(COLOR_TEXT_BODY)),
         Span::styled(" [Q] ", Style::default().fg(COLOR_TEXT_MUTED).add_modifier(Modifier::BOLD)),
         Span::styled("Quit", Style::default().fg(COLOR_TEXT_MUTED)),
     ]);
-
     let widget = Paragraph::new(text).alignment(Alignment::Center);
     frame.render_widget(widget, area);
 }

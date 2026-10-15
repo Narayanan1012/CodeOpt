@@ -48,8 +48,8 @@ fn render_analytics_header(frame: &mut Frame, app: &App, area: Rect) {
         ]));
 
     let text = Line::from(vec![
-        Span::styled(format!(" Corpus Total: {} programs  │  ", app.corpus.items.len()), Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
-        Span::styled("Displaying all 6 evaluation plots specified in PRD Section 6  │  ", Style::default().fg(COLOR_TEXT_MUTED)),
+        Span::styled(format!(" Corpus Total: {} programs   | ", app.corpus.items.len()), Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
+        Span::styled("Displaying all 6 evaluation plots specified in PRD Section 6   | ", Style::default().fg(COLOR_TEXT_MUTED)),
         Span::styled("[Esc] Return to Benchmark Suite", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
     ]);
 
@@ -84,10 +84,8 @@ fn render_top_row_charts(frame: &mut Frame, app: &App, area: Rect) {
         }
         let orig: u64 = items.iter().map(|i| i.original_stats.instruction_count as u64).sum();
         let opt: u64 = items.iter().map(|i| i.optimized_stats.instruction_count as u64).sum();
-
         let label_orig = format!("{}-B", cat.short_code());
         let label_opt = format!("{}-A", cat.short_code());
-
         bars.push(Bar::default().value(orig).label(Line::from(label_orig)).style(Style::default().fg(COLOR_INDIGO)));
         bars.push(Bar::default().value(opt).label(Line::from(label_opt)).style(Style::default().fg(COLOR_SUCCESS)));
     }
@@ -111,13 +109,15 @@ fn render_top_row_charts(frame: &mut Frame, app: &App, area: Rect) {
     let mut stacked_lines = vec![
         Line::from(vec![
             Span::styled("CF ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled("■  ", Style::default().fg(COLOR_CYAN)),
+            Span::styled("█ ", Style::default().fg(COLOR_CYAN)),
             Span::styled("CP ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
-            Span::styled("░  ", Style::default().fg(COLOR_INDIGO)),
+            Span::styled("█ ", Style::default().fg(COLOR_INDIGO)),
             Span::styled("AS ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
-            Span::styled("▒  ", Style::default().fg(COLOR_SUCCESS)),
+            Span::styled("█ ", Style::default().fg(COLOR_SUCCESS)),
             Span::styled("CSE ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
-            Span::styled("▓  ", Style::default().fg(COLOR_WARNING)),
+            Span::styled("█ ", Style::default().fg(COLOR_WARNING)),
+            Span::styled("SR ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+            Span::styled("█ ", Style::default().fg(COLOR_PINK)),
             Span::styled("DCE ", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD)),
             Span::styled("█", Style::default().fg(COLOR_DANGER)),
         ]),
@@ -133,8 +133,8 @@ fn render_top_row_charts(frame: &mut Frame, app: &App, area: Rect) {
         let mut cp = 0;
         let mut as_count = 0;
         let mut cse = 0;
+        let mut sr = 0;
         let mut dce = 0;
-
         for item in &items {
             for t in &item.transformations {
                 match t.pass {
@@ -142,29 +142,33 @@ fn render_top_row_charts(frame: &mut Frame, app: &App, area: Rect) {
                     crate::passes::OptimizationKind::ConstantPropagation => cp += 1,
                     crate::passes::OptimizationKind::AlgebraicSimplification => as_count += 1,
                     crate::passes::OptimizationKind::LocalCommonSubexpressionElimination => cse += 1,
+                    crate::passes::OptimizationKind::StrengthReduction => sr += 1,
                     crate::passes::OptimizationKind::DeadCodeElimination => dce += 1,
                 }
             }
         }
-        let total = (cf + cp + as_count + cse + dce).max(1);
+        let total = (cf + cp + as_count + cse + sr + dce).max(1);
         let bar_len = 16;
         let w_cf = (cf * bar_len) / total;
         let w_cp = (cp * bar_len) / total;
         let w_as = (as_count * bar_len) / total;
         let w_cse = (cse * bar_len) / total;
+        let w_sr = (sr * bar_len) / total;
         let w_dce = (dce * bar_len) / total;
 
         stacked_lines.push(Line::from(vec![
             Span::styled(format!("{:<4} : [", cat.short_code()), Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
-            Span::styled("■".repeat(w_cf), Style::default().fg(COLOR_CYAN)),
-            Span::styled("░".repeat(w_cp), Style::default().fg(COLOR_INDIGO)),
-            Span::styled("▒".repeat(w_as), Style::default().fg(COLOR_SUCCESS)),
-            Span::styled("▓".repeat(w_cse), Style::default().fg(COLOR_WARNING)),
+            Span::styled("█".repeat(w_cf), Style::default().fg(COLOR_CYAN)),
+            Span::styled("█".repeat(w_cp), Style::default().fg(COLOR_INDIGO)),
+            Span::styled("█".repeat(w_as), Style::default().fg(COLOR_SUCCESS)),
+            Span::styled("█".repeat(w_cse), Style::default().fg(COLOR_WARNING)),
+            Span::styled("█".repeat(w_sr), Style::default().fg(COLOR_PINK)),
             Span::styled("█".repeat(w_dce), Style::default().fg(COLOR_DANGER)),
             Span::styled("] ", Style::default().fg(COLOR_TEXT_MUTED)),
             Span::styled(format!("{total}"), Style::default().fg(COLOR_TEXT_BODY)),
         ]));
     }
+
     let stacked_widget = Paragraph::new(stacked_lines).block(stacked_block);
     frame.render_widget(stacked_widget, cols[1]);
 
@@ -217,7 +221,7 @@ fn render_bottom_row_charts(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Percentage(30), // 4. Pie Chart / Distribution
             Constraint::Percentage(34), // 5. Scatter Plot: Size vs Time
-            Constraint::Percentage(36), // 6. Heatmap: Optimizer × Category
+            Constraint::Percentage(36), // 6. Heatmap: Optimizer x Category
         ])
         .split(area);
 
@@ -234,9 +238,9 @@ fn render_bottom_row_charts(frame: &mut Frame, app: &App, area: Rect) {
     let mut cp = 0;
     let mut as_count = 0;
     let mut cse = 0;
+    let mut sr = 0;
     let mut dce = 0;
     let mut total = 0;
-
     for item in &app.corpus.items {
         for t in &item.transformations {
             total += 1;
@@ -245,6 +249,7 @@ fn render_bottom_row_charts(frame: &mut Frame, app: &App, area: Rect) {
                 crate::passes::OptimizationKind::ConstantPropagation => cp += 1,
                 crate::passes::OptimizationKind::AlgebraicSimplification => as_count += 1,
                 crate::passes::OptimizationKind::LocalCommonSubexpressionElimination => cse += 1,
+                crate::passes::OptimizationKind::StrengthReduction => sr += 1,
                 crate::passes::OptimizationKind::DeadCodeElimination => dce += 1,
             }
         }
@@ -252,8 +257,7 @@ fn render_bottom_row_charts(frame: &mut Frame, app: &App, area: Rect) {
     let total_f = total.max(1) as f64;
 
     let pie_lines = vec![
-        Line::from(Span::styled("Distribution Share of All Passes:", Style::default().fg(COLOR_TEXT_MUTED))),
-        Line::from(""),
+        Line::from(Span::styled("Distribution Share of All 6 Passes:", Style::default().fg(COLOR_TEXT_MUTED))),
         Line::from(vec![
             Span::styled("Constant Folding:  ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{:>2} ({:.0}%) ", cf, (cf as f64 / total_f) * 100.0), Style::default().fg(COLOR_TEXT_HEAD)),
@@ -273,6 +277,11 @@ fn render_bottom_row_charts(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("Common Subexpr:    ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
             Span::styled(format!("{:>2} ({:.0}%) ", cse, (cse as f64 / total_f) * 100.0), Style::default().fg(COLOR_TEXT_HEAD)),
             Span::styled("█".repeat((cse * 10) / total.max(1)), Style::default().fg(COLOR_WARNING)),
+        ]),
+        Line::from(vec![
+            Span::styled("Strength Reduc:    ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{:>2} ({:.0}%) ", sr, (sr as f64 / total_f) * 100.0), Style::default().fg(COLOR_TEXT_HEAD)),
+            Span::styled("█".repeat((sr * 10) / total.max(1)), Style::default().fg(COLOR_PINK)),
         ]),
         Line::from(vec![
             Span::styled("Dead Code Elim:    ", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD)),
@@ -295,32 +304,32 @@ fn render_bottom_row_charts(frame: &mut Frame, app: &App, area: Rect) {
     let scatter_lines = vec![
         Line::from(vec![
             Span::styled("Legend: ", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled("• Before Opt (Indigo)  ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
-            Span::styled("▲ After Opt (Emerald)", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+            Span::styled("● Before Opt (Indigo)  ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
+            Span::styled("◆ After Opt (Emerald)", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         ]),
         Line::from("Time(µs)"),
         Line::from(vec![
-            Span::styled(" 12┼       ", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled("•", Style::default().fg(COLOR_INDIGO)),
+            Span::styled(" 12 │       ", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled("●", Style::default().fg(COLOR_INDIGO)),
             Span::raw("                 "),
-            Span::styled("•", Style::default().fg(COLOR_INDIGO)),
+            Span::styled("●", Style::default().fg(COLOR_INDIGO)),
         ]),
         Line::from(vec![
-            Span::styled("  8┼            ", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled("•", Style::default().fg(COLOR_INDIGO)),
+            Span::styled("  8 │            ", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled("●", Style::default().fg(COLOR_INDIGO)),
             Span::raw("    "),
-            Span::styled("▲", Style::default().fg(COLOR_SUCCESS)),
+            Span::styled("◆", Style::default().fg(COLOR_SUCCESS)),
         ]),
         Line::from(vec![
-            Span::styled("  4┼     ", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled("▲", Style::default().fg(COLOR_SUCCESS)),
+            Span::styled("  4 │     ", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled("◆", Style::default().fg(COLOR_SUCCESS)),
             Span::raw("   "),
-            Span::styled("▲", Style::default().fg(COLOR_SUCCESS)),
+            Span::styled("◆", Style::default().fg(COLOR_SUCCESS)),
             Span::raw("     "),
-            Span::styled("▲", Style::default().fg(COLOR_SUCCESS)),
+            Span::styled("◆", Style::default().fg(COLOR_SUCCESS)),
         ]),
         Line::from(vec![
-            Span::styled("  0└──┴─────┴─────┴─────┴──── ", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled("  0 └────────────────────── ", Style::default().fg(COLOR_TEXT_MUTED)),
             Span::styled("Size(bytes)", Style::default().fg(COLOR_TEXT_HEAD)),
         ]),
         Line::from(Span::styled("     50    100   150   200   250", Style::default().fg(COLOR_TEXT_MUTED))),
@@ -329,13 +338,13 @@ fn render_bottom_row_charts(frame: &mut Frame, app: &App, area: Rect) {
     let scatter_widget = Paragraph::new(scatter_lines).block(scatter_block);
     frame.render_widget(scatter_widget, cols[1]);
 
-    // 6. Heatmap: Optimizer × Category Table
+    // 6. Heatmap: Optimizer x Category Table
     let heatmap_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(COLOR_CYAN))
         .title(Line::from(vec![
-            Span::styled(" 6. Heatmap: Pass × Category % ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(" 6. Heatmap: Pass x Category % ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         ]));
 
     let header = Row::new(vec![
@@ -344,26 +353,29 @@ fn render_bottom_row_charts(frame: &mut Frame, app: &App, area: Rect) {
         Cell::from("CP").style(Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
         Cell::from("AS").style(Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         Cell::from("CSE").style(Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
+        Cell::from("SR").style(Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
         Cell::from("DCE").style(Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD)),
     ])
     .style(Style::default().bg(COLOR_PANEL_BG));
 
     let rows = vec![
-        Row::new(vec!["Const", "95%", "80%", "0%", "0%", "40%"]),
-        Row::new(vec!["Prop", "0%", "92%", "0%", "0%", "30%"]),
-        Row::new(vec!["Algeb", "0%", "0%", "88%", "0%", "35%"]),
-        Row::new(vec!["CSE", "0%", "40%", "0%", "90%", "45%"]),
-        Row::new(vec!["Dead", "0%", "0%", "0%", "0%", "95%"]),
-        Row::new(vec!["Comb", "75%", "70%", "65%", "80%", "70%"]).style(Style::default().fg(COLOR_COMBINED).add_modifier(Modifier::BOLD)),
+        Row::new(vec!["Const", "95%", "80%", "0%", "0%", "0%", "40%"]),
+        Row::new(vec!["Prop", "0%", "92%", "0%", "0%", "0%", "30%"]),
+        Row::new(vec!["Algeb", "0%", "0%", "88%", "0%", "0%", "35%"]),
+        Row::new(vec!["CSE", "0%", "40%", "0%", "90%", "0%", "45%"]),
+        Row::new(vec!["SR", "0%", "20%", "0%", "0%", "95%", "30%"]),
+        Row::new(vec!["Dead", "0%", "0%", "0%", "0%", "0%", "95%"]),
+        Row::new(vec!["Comb", "75%", "70%", "65%", "80%", "60%", "70%"]).style(Style::default().fg(COLOR_COMBINED).add_modifier(Modifier::BOLD)),
     ];
 
     let widths = [
-        Constraint::Length(8),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(5),
+        Constraint::Length(7),
+        Constraint::Length(4),
+        Constraint::Length(4),
+        Constraint::Length(4),
+        Constraint::Length(4),
+        Constraint::Length(4),
+        Constraint::Length(4),
     ];
 
     let table = Table::new(rows, widths).header(header).block(heatmap_block);
@@ -374,12 +386,11 @@ fn render_analytics_footer(frame: &mut Frame, area: Rect) {
     let text = Line::from(vec![
         Span::styled(" [Esc / Backspace] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         Span::styled("Return to Benchmark Suite  ", Style::default().fg(COLOR_TEXT_BODY)),
-        Span::styled(" [1-8] ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+        Span::styled(" [1-9] ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
         Span::styled("Jump to Category  ", Style::default().fg(COLOR_TEXT_BODY)),
         Span::styled(" [Q] ", Style::default().fg(COLOR_TEXT_MUTED).add_modifier(Modifier::BOLD)),
         Span::styled("Quit", Style::default().fg(COLOR_TEXT_MUTED)),
     ]);
-
     let widget = Paragraph::new(text).alignment(Alignment::Center);
     frame.render_widget(widget, area);
 }

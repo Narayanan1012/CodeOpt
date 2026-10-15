@@ -116,7 +116,7 @@ fn parse_assignment(
             let operation = OpCode::from_binary_token(operator).ok_or_else(|| {
                 error(
                     original_line,
-                    "binary operator must be one of: +, -, *, /, %",
+                    "binary operator must be one of: +, -, *, /, %, <<, >>",
                 )
             })?;
             Ok(instruction(

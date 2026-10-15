@@ -30,6 +30,8 @@ pub enum OpCode {
     Mul,
     Div,
     Mod,
+    Shl,
+    Shr,
     Assign,
     IfFalse,
     Goto,
@@ -47,6 +49,8 @@ impl OpCode {
             "*" => Some(Self::Mul),
             "/" => Some(Self::Div),
             "%" => Some(Self::Mod),
+            "<<" => Some(Self::Shl),
+            ">>" => Some(Self::Shr),
             _ => None,
         }
     }
@@ -58,6 +62,8 @@ impl OpCode {
             Self::Mul => Some("*"),
             Self::Div => Some("/"),
             Self::Mod => Some("%"),
+            Self::Shl => Some("<<"),
+            Self::Shr => Some(">>"),
             _ => None,
         }
     }

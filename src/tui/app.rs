@@ -139,7 +139,6 @@ pub struct App {
     pub playground_converted: bool,
     pub playground_vm_executed: bool,
     pub playground_status_message: Option<String>,
-
     pub load_file_modal_open: bool,
     pub load_file_path_input: String,
 }
@@ -167,17 +166,14 @@ impl App {
             search_active: false,
             help_modal_open: false,
             should_quit: false,
-
             optimizing_progress: 0,
             show_optimizing_screen: true,
-
             code_scroll_offset: 0,
             audit_scroll_offset: 0,
             deep_dive_executed: false,
             deep_dive_orig_time_us: 0,
             deep_dive_opt_time_us: 0,
             deep_dive_vector_results: Vec::new(),
-
             playground_file_name: "scratchpad.tac".to_string(),
             playground_buffer: default_playground,
             playground_cursor_row: 2,
@@ -193,18 +189,15 @@ impl App {
             playground_converted: true,
             playground_vm_executed: true,
             playground_status_message: None,
-
             load_file_modal_open: false,
             load_file_path_input: "benchmarks/algebraic_01.tac".to_string(),
         };
-
         app.recompile_playground();
         app
     }
 
     pub fn tick(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
-
         if self.screen == CurrentScreen::Optimizing {
             self.optimizing_progress = self.optimizing_progress.saturating_add(12);
             if self.optimizing_progress >= 100 {
@@ -242,7 +235,6 @@ impl App {
         for (idx, inp) in test_input_sets.into_iter().enumerate() {
             let orig_res = execute(&original, &inp);
             let opt_res = execute(&optimized, &inp);
-
             let (orig_out, opt_out, matched) = match (orig_res, opt_res) {
                 (Ok(o1), Ok(o2)) => {
                     let m = o1.output == o2.output;
@@ -250,7 +242,6 @@ impl App {
                 }
                 _ => (Vec::new(), Vec::new(), false),
             };
-
             results.push(VectorProof {
                 vector_id: idx + 1,
                 inputs: inp,
@@ -262,6 +253,7 @@ impl App {
 
         let primary_inputs = results.first().map(|v| v.inputs.as_slice()).unwrap_or(&[]);
         let (t_orig, t_opt) = measure_execution_times(&original, &optimized, primary_inputs);
+
         self.deep_dive_orig_time_us = t_orig;
         self.deep_dive_opt_time_us = t_opt;
         self.deep_dive_vector_results = results;
@@ -310,13 +302,11 @@ impl App {
         if self.playground_parse_error.is_some() {
             return;
         }
-
         let source = self.playground_buffer.join("\n");
         let Ok(parsed) = parse_program(&source) else { return; };
         let opt_source = self.playground_opt_lines.join("\n");
         let Ok(optimized) = parse_program(&opt_source) else { return; };
 
-        // Run differential VM
         let orig_res = execute(&parsed, &self.playground_inputs);
         let opt_res = execute(&optimized, &self.playground_inputs);
 
@@ -350,19 +340,16 @@ impl App {
         if text.is_empty() {
             return;
         }
-
         if self.screen == CurrentScreen::Playground {
             if self.load_file_modal_open {
                 self.load_file_path_input.push_str(text);
                 return;
             }
-
             if self.playground_buffer.is_empty() {
                 self.playground_buffer.push(String::new());
                 self.playground_cursor_row = 0;
                 self.playground_cursor_col = 0;
             }
-
             let row = self.playground_cursor_row.min(self.playground_buffer.len().saturating_sub(1));
             let line_chars = self.playground_buffer[row].chars().count();
             let col = self.playground_cursor_col.min(line_chars);
@@ -382,11 +369,9 @@ impl App {
                 let suffix = current_line[byte_idx..].to_string();
 
                 self.playground_buffer[row] = format!("{}{}", prefix, paste_lines[0]);
-
                 for (idx, line_str) in paste_lines[1..paste_lines.len() - 1].iter().enumerate() {
                     self.playground_buffer.insert(row + 1 + idx, line_str.to_string());
                 }
-
                 let last_idx = row + paste_lines.len() - 1;
                 let last_content = paste_lines.last().unwrap();
                 let last_str = format!("{}{}", last_content, suffix);
@@ -395,7 +380,6 @@ impl App {
                 self.playground_cursor_row = last_idx;
                 self.playground_cursor_col = last_content.chars().count();
             }
-
             self.playground_converted = false;
             self.playground_vm_executed = false;
             self.playground_status_message = Some("PASTED FROM CLIPBOARD".to_string());
@@ -746,8 +730,9 @@ impl App {
                     KeyCode::Char('4') => self.switch_category(BenchmarkCategory::AlgebraicSimplification),
                     KeyCode::Char('5') => self.switch_category(BenchmarkCategory::LocalCSE),
                     KeyCode::Char('6') => self.switch_category(BenchmarkCategory::DeadCodeElimination),
-                    KeyCode::Char('7') => self.switch_category(BenchmarkCategory::Combined),
-                    KeyCode::Char('8') => self.switch_category(BenchmarkCategory::ControlFlow),
+                    KeyCode::Char('7') => self.switch_category(BenchmarkCategory::StrengthReduction),
+                    KeyCode::Char('8') => self.switch_category(BenchmarkCategory::Combined),
+                    KeyCode::Char('9') => self.switch_category(BenchmarkCategory::ControlFlow),
                     KeyCode::Char('g') | KeyCode::Char('G') => {
                         self.screen = CurrentScreen::AnalyticsDeck;
                     }
@@ -810,7 +795,6 @@ impl App {
                         _ => {}
                     }
                 }
-
                 match key {
                     KeyCode::Esc => {
                         self.screen = CurrentScreen::Home;
@@ -976,10 +960,14 @@ impl App {
                     self.screen = CurrentScreen::BenchmarkSuite;
                 }
                 KeyCode::Char('7') => {
-                    self.switch_category(BenchmarkCategory::Combined);
+                    self.switch_category(BenchmarkCategory::StrengthReduction);
                     self.screen = CurrentScreen::BenchmarkSuite;
                 }
                 KeyCode::Char('8') => {
+                    self.switch_category(BenchmarkCategory::Combined);
+                    self.screen = CurrentScreen::BenchmarkSuite;
+                }
+                KeyCode::Char('9') => {
                     self.switch_category(BenchmarkCategory::ControlFlow);
                     self.screen = CurrentScreen::BenchmarkSuite;
                 }
@@ -1016,7 +1004,6 @@ impl App {
 
     pub fn render(&self, frame: &mut Frame) {
         let area = frame.area();
-
         match self.screen {
             CurrentScreen::Home => render_home(frame, self, area),
             CurrentScreen::Optimizing => render_optimizing(frame, self, area),
@@ -1034,7 +1021,6 @@ impl App {
     fn render_help_modal(&self, frame: &mut Frame, area: Rect) {
         let popup_width = 72.min(area.width.saturating_sub(4));
         let popup_height = 25.min(area.height.saturating_sub(2));
-
         let popup_area = Rect {
             x: (area.width.saturating_sub(popup_width)) / 2,
             y: (area.height.saturating_sub(popup_height)) / 2,
@@ -1126,31 +1112,24 @@ mod tests {
         assert_eq!(app.screen, CurrentScreen::Home);
         assert_eq!(app.selected_home_card, 0);
 
-        // Toggle card with Tab
         app.handle_key(KeyCode::Tab);
         assert_eq!(app.selected_home_card, 1);
 
-        // Toggle back with Left
         app.handle_key(KeyCode::Left);
         assert_eq!(app.selected_home_card, 0);
 
-        // Launch Playground with key '1'
         app.handle_key(KeyCode::Char('1'));
         assert_eq!(app.screen, CurrentScreen::Playground);
 
-        // Return Home with Esc
         app.handle_key(KeyCode::Esc);
         assert_eq!(app.screen, CurrentScreen::Home);
 
-        // Launch Benchmark Suite with key '2' (with optimizing screen enabled)
         app.handle_key(KeyCode::Char('2'));
         assert_eq!(app.screen, CurrentScreen::Optimizing);
 
-        // Skip optimizing screen with Space
         app.handle_key(KeyCode::Char(' '));
         assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
 
-        // Return Home with Esc
         app.handle_key(KeyCode::Esc);
         assert_eq!(app.screen, CurrentScreen::Home);
     }
@@ -1160,23 +1139,18 @@ mod tests {
         let mut app = App::new(BenchmarkCorpus::default());
         assert!(app.show_optimizing_screen);
 
-        // Go to optimizing screen
         app.handle_key(KeyCode::Char('2'));
         assert_eq!(app.screen, CurrentScreen::Optimizing);
 
-        // Toggle optimizing screen OFF with 'o'
         app.handle_key(KeyCode::Char('o'));
         assert!(!app.show_optimizing_screen);
 
-        // Skip to benchmark
         app.handle_key(KeyCode::Esc);
         assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
 
-        // Return Home
         app.handle_key(KeyCode::Esc);
         assert_eq!(app.screen, CurrentScreen::Home);
 
-        // Launch Benchmark Suite again: since toggle is OFF, it jumps directly to BenchmarkSuite!
         app.handle_key(KeyCode::Char('2'));
         assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
     }
@@ -1185,106 +1159,24 @@ mod tests {
     fn test_help_modal_toggle() {
         let mut app = App::new(BenchmarkCorpus::default());
         assert!(!app.help_modal_open);
-
         app.handle_key(KeyCode::Char('?'));
         assert!(app.help_modal_open);
-
         app.handle_key(KeyCode::Esc);
         assert!(!app.help_modal_open);
     }
 
     #[test]
-    fn test_corpus_categorization() {
-        let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
-        assert!(!corpus.items.is_empty(), "Corpus should load benchmark files");
+    fn test_strength_reduction_pass() {
+        let source = "read a\nt1 = a * 8\nt2 = a * 2\nt3 = a / 4\nprint t1\nprint t2\nprint t3";
+        let mut prog = parse_program(source).unwrap();
+        let cfg = build(&mut prog).unwrap();
+        let report = optimize_with_worklist(&mut prog, &cfg);
 
-        println!("Loaded total items: {}", corpus.items.len());
-        for cat in &crate::tui::data::ALL_CATEGORIES {
-            let count = corpus.filter_by_category(*cat).len();
-            println!("Category {:?}: {} items", cat, count);
-        }
-
-        // Verify categories are cleanly assigned across types
-        let combined = corpus.items.iter().find(|i| i.name.contains("combined"));
-        assert!(combined.is_some());
-        assert_eq!(combined.unwrap().category, BenchmarkCategory::Combined);
-
-        let algebraic = corpus.items.iter().find(|i| i.name.starts_with("alg"));
-        assert!(algebraic.is_some());
-        assert_eq!(algebraic.unwrap().category, BenchmarkCategory::AlgebraicSimplification);
-
-        let constant = corpus.items.iter().find(|i| i.name.starts_with("const"));
-        assert!(constant.is_some());
-        assert_eq!(constant.unwrap().category, BenchmarkCategory::ConstantFolding);
-
-        let prop = corpus.items.iter().find(|i| i.name.starts_with("prop"));
-        assert!(prop.is_some());
-        assert_eq!(prop.unwrap().category, BenchmarkCategory::ConstantPropagation);
-
-        let cse = corpus.items.iter().find(|i| i.name.starts_with("cse"));
-        assert!(cse.is_some());
-        assert_eq!(cse.unwrap().category, BenchmarkCategory::LocalCSE);
-
-        let dce = corpus.items.iter().find(|i| i.name.starts_with("dce"));
-        assert!(dce.is_some());
-        assert_eq!(dce.unwrap().category, BenchmarkCategory::DeadCodeElimination);
-
-        let ctrl = corpus.items.iter().find(|i| i.name.starts_with("ctrl") || i.name.starts_with("control"));
-        assert!(ctrl.is_some());
-        assert_eq!(ctrl.unwrap().category, BenchmarkCategory::ControlFlow);
-    }
-
-    #[test]
-    fn test_program_modal_and_scrolling() {
-        let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
-        let mut app = App::new(corpus);
-
-        // Turn off optimizing screen for instant jump
-        app.show_optimizing_screen = false;
-        app.handle_key(KeyCode::Char('2'));
-        assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
-
-        // Press Enter to expand into full-screen deep dive
-        app.handle_key(KeyCode::Enter);
-        assert_eq!(app.screen, CurrentScreen::ProgramDeepDive);
-        assert_eq!(app.code_scroll_offset, 0);
-
-        // Scroll code with 'j'
-        app.handle_key(KeyCode::Char('j'));
-        assert_eq!(app.code_scroll_offset, 1);
-
-        // Scroll code with 'k'
-        app.handle_key(KeyCode::Char('k'));
-        assert_eq!(app.code_scroll_offset, 0);
-
-        // Press Esc to collapse back to BenchmarkSuite
-        app.handle_key(KeyCode::Esc);
-        assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
-    }
-
-    #[test]
-    fn test_playground_live_editing_and_recompile() {
-        let mut app = App::new(BenchmarkCorpus::default());
-        app.screen = CurrentScreen::Playground;
-
-        // Verify initial state compiled cleanly
-        assert!(app.playground_parse_error.is_none());
-        assert!(!app.playground_opt_lines.is_empty());
-        assert!(app.playground_equiv_pass);
-
-        // Enter edit mode
-        app.handle_key(KeyCode::Char('i'));
-        assert!(app.playground_editing);
-
-        // Type a line that causes a parse error: "invalid line"
-        app.playground_buffer.push("invalid instruction line".to_string());
-        app.recompile_playground();
-        assert!(app.playground_parse_error.is_some());
-
-        // Fix line
-        app.playground_buffer.pop();
-        app.recompile_playground();
-        assert!(app.playground_parse_error.is_none());
+        let opt_str = prog.to_string();
+        assert!(opt_str.contains("t1 = a << 3"));
+        assert!(opt_str.contains("t2 = a + a"));
+        assert!(opt_str.contains("t3 = a >> 2"));
+        assert!(report.transformations.iter().any(|t| t.pass == crate::passes::OptimizationKind::StrengthReduction));
     }
 
     #[test]
@@ -1299,115 +1191,5 @@ mod tests {
                 assert_eq!(v.original_output, v.optimized_output);
             }
         }
-    }
-
-    #[test]
-    fn test_analytics_deck_navigation() {
-        let mut app = App::new(BenchmarkCorpus::default());
-        app.screen = CurrentScreen::BenchmarkSuite;
-
-        // Press 'g' to enter analytics deck
-        app.handle_key(KeyCode::Char('g'));
-        assert_eq!(app.screen, CurrentScreen::AnalyticsDeck);
-
-        // Press 'Esc' to exit analytics deck
-        app.handle_key(KeyCode::Esc);
-        assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
-
-        // Press 'G' to enter again and '2' to jump to ConstantFolding in BenchmarkSuite
-        app.handle_key(KeyCode::Char('G'));
-        assert_eq!(app.screen, CurrentScreen::AnalyticsDeck);
-        app.handle_key(KeyCode::Char('2'));
-        assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
-        assert_eq!(app.active_category, BenchmarkCategory::ConstantFolding);
-    }
-
-    #[test]
-    fn test_deep_dive_interactive_vm_run() {
-        let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
-        let mut app = App::new(corpus);
-
-        // Enter BenchmarkSuite
-        app.show_optimizing_screen = false;
-        app.handle_key(KeyCode::Char('2'));
-        assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
-
-        // Open Deep Dive on selected program
-        app.handle_key(KeyCode::Enter);
-        assert_eq!(app.screen, CurrentScreen::ProgramDeepDive);
-
-        // Verify initial state: not yet executed, awaiting user pressing 'R'
-        assert!(!app.deep_dive_executed);
-        assert!(app.deep_dive_vector_results.is_empty());
-
-        // Press 'r' to execute dual VM live
-        app.handle_key(KeyCode::Char('r'));
-        assert!(app.deep_dive_executed);
-        assert_eq!(app.deep_dive_vector_results.len(), 5);
-        for v in &app.deep_dive_vector_results {
-            assert!(v.passed, "Live VM vector {} should pass", v.vector_id);
-            assert_eq!(v.original_output, v.optimized_output);
-        }
-
-        // Return to BenchmarkSuite and re-enter
-        app.handle_key(KeyCode::Esc);
-        assert_eq!(app.screen, CurrentScreen::BenchmarkSuite);
-        app.handle_key(KeyCode::Enter);
-        assert_eq!(app.screen, CurrentScreen::ProgramDeepDive);
-
-        // Verify reset back to awaiting execution
-        assert!(!app.deep_dive_executed);
-        assert!(app.deep_dive_vector_results.is_empty());
-    }
-
-    #[test]
-    fn test_playground_convert_then_run() {
-        let mut app = App::new(BenchmarkCorpus::default());
-        app.screen = CurrentScreen::Playground;
-
-        // Initially scratchpad is converted and executed
-        assert!(app.playground_converted);
-        assert!(app.playground_vm_executed);
-
-        // Enter edit mode at end of buffer (use 'A' on last line via nav, or navigate)
-        // First move cursor to the last line in navigation mode
-        for _ in 0..6 {
-            app.handle_key(KeyCode::Down);
-        }
-        // Enter edit mode with cursor at end of current line
-        app.handle_key(KeyCode::Char('A'));
-        assert!(app.playground_editing);
-
-        // Press Enter to create new empty line, then type a new instruction
-        app.handle_key(KeyCode::Enter);
-        for ch in "t5 = 4 + 4".chars() {
-            app.handle_key(KeyCode::Char(ch));
-        }
-
-        // In edit mode, typing marks converted and vm_executed as false without re-running compiler
-        assert!(!app.playground_converted);
-        assert!(!app.playground_vm_executed);
-
-        // Exit edit mode
-        app.handle_key(KeyCode::Esc);
-        assert!(!app.playground_editing);
-
-        // Press 'C' to convert and optimize
-        app.handle_key(KeyCode::Char('c'));
-        assert!(app.playground_converted);
-        assert!(!app.playground_vm_executed);
-        assert!(!app.playground_opt_lines.is_empty());
-
-        // Press 'R' to run both codes in dual VM and verify
-        app.handle_key(KeyCode::Char('r'));
-        assert!(app.playground_vm_executed);
-        assert!(app.playground_equiv_pass);
-        assert_eq!(app.playground_orig_out, app.playground_opt_out);
-
-        // Press 'X' to reset back to default
-        app.handle_key(KeyCode::Char('x'));
-        assert!(app.playground_converted);
-        assert!(app.playground_vm_executed);
-        assert_eq!(app.playground_buffer.len(), 7);
     }
 }

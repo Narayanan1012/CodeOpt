@@ -13,14 +13,16 @@ pub enum OptimizationKind {
     AlgebraicSimplification,
     LocalCommonSubexpressionElimination,
     DeadCodeElimination,
+    StrengthReduction,
 }
 
-pub const REVIEW_ONE_PASSES: [OptimizationKind; 5] = [
+pub const REVIEW_ONE_PASSES: [OptimizationKind; 6] = [
     OptimizationKind::ConstantFolding,
     OptimizationKind::ConstantPropagation,
     OptimizationKind::AlgebraicSimplification,
     OptimizationKind::LocalCommonSubexpressionElimination,
     OptimizationKind::DeadCodeElimination,
+    OptimizationKind::StrengthReduction,
 ];
 
 const WORKLIST_ROUND_LIMIT: usize = 16;
@@ -94,6 +96,7 @@ pub fn optimize_with_worklist(program: &mut Program, cfg: &ControlFlowGraph) -> 
 
     let dce = eliminate_dead_code(program);
     transformations.extend(dce);
+
     OptimizationReport {
         transformations,
         worklist_events,
@@ -143,6 +146,7 @@ fn drain_basic_worklist(
         let values = known_values_before(program, cfg, instruction_id);
         let offset = instruction_offsets[&instruction_id];
         let transformation_count = transformations.len();
+
         propagate_operands(&mut program.instructions[offset], &values, transformations);
         simplify_instruction(&mut program.instructions[offset], transformations);
 
@@ -233,6 +237,7 @@ fn propagate_operands(
         changed |= replacement != instruction.arg1;
         instruction.arg1 = replacement;
     }
+
     if instruction_uses_arg2(instruction.op) {
         let replacement = resolve_copy(&instruction.arg2, values);
         changed |= replacement != instruction.arg2;
@@ -255,17 +260,18 @@ fn simplify_instruction(instruction: &mut Instruction, transformations: &mut Vec
     }
 
     if let (Operand::Const(left), Operand::Const(right)) = (&instruction.arg1, &instruction.arg2)
-        && let Some(result) = evaluate(instruction.op, *left, *right) {
-            let before = instruction.clone();
-            replace_with_assignment(instruction, Operand::Const(result));
-            transformations.push(Transformation {
-                pass: OptimizationKind::ConstantFolding,
-                instruction_id: instruction.id,
-                before,
-                after: instruction.clone(),
-            });
-            return;
-        }
+        && let Some(result) = evaluate(instruction.op, *left, *right)
+    {
+        let before = instruction.clone();
+        replace_with_assignment(instruction, Operand::Const(result));
+        transformations.push(Transformation {
+            pass: OptimizationKind::ConstantFolding,
+            instruction_id: instruction.id,
+            before,
+            after: instruction.clone(),
+        });
+        return;
+    }
 
     if let Some(replacement) = algebraic_replacement(instruction) {
         let before = instruction.clone();
@@ -276,6 +282,68 @@ fn simplify_instruction(instruction: &mut Instruction, transformations: &mut Vec
             before,
             after: instruction.clone(),
         });
+        return;
+    }
+
+    if let Some((new_op, new_arg1, new_arg2)) = strength_reduction_replacement(instruction) {
+        let before = instruction.clone();
+        instruction.op = new_op;
+        instruction.arg1 = new_arg1;
+        instruction.arg2 = new_arg2;
+        transformations.push(Transformation {
+            pass: OptimizationKind::StrengthReduction,
+            instruction_id: instruction.id,
+            before,
+            after: instruction.clone(),
+        });
+    }
+}
+
+fn is_power_of_two(n: i32) -> Option<i32> {
+    if n > 1 && (n & (n - 1)) == 0 {
+        Some(n.trailing_zeros() as i32)
+    } else {
+        None
+    }
+}
+
+fn strength_reduction_replacement(
+    instruction: &Instruction,
+) -> Option<(OpCode, Operand, Operand)> {
+    let left = &instruction.arg1;
+    let right = &instruction.arg2;
+
+    match instruction.op {
+        OpCode::Mul => {
+            if is_constant(right, 2) {
+                Some((OpCode::Add, left.clone(), left.clone()))
+            } else if is_constant(left, 2) {
+                Some((OpCode::Add, right.clone(), right.clone()))
+            } else if let Operand::Const(c) = right
+                && *c > 2
+                && let Some(k) = is_power_of_two(*c)
+            {
+                Some((OpCode::Shl, left.clone(), Operand::Const(k)))
+            } else if let Operand::Const(c) = left
+                && *c > 2
+                && let Some(k) = is_power_of_two(*c)
+            {
+                Some((OpCode::Shl, right.clone(), Operand::Const(k)))
+            } else {
+                None
+            }
+        }
+        OpCode::Div => {
+            if let Operand::Const(c) = right
+                && *c > 1
+                && let Some(k) = is_power_of_two(*c)
+            {
+                Some((OpCode::Shr, left.clone(), Operand::Const(k)))
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -314,7 +382,6 @@ fn resolve_copy(operand: &Operand, values: &HashMap<String, Operand>) -> Operand
 fn algebraic_replacement(instruction: &Instruction) -> Option<Operand> {
     let left = &instruction.arg1;
     let right = &instruction.arg2;
-
     match instruction.op {
         OpCode::Add if is_constant(left, 0) => Some(right.clone()),
         OpCode::Add if is_constant(right, 0) => Some(left.clone()),
@@ -325,6 +392,8 @@ fn algebraic_replacement(instruction: &Instruction) -> Option<Operand> {
         OpCode::Mul if is_constant(right, 1) => Some(left.clone()),
         OpCode::Div if is_constant(right, 1) => Some(left.clone()),
         OpCode::Mod if is_constant(right, 1) => Some(Operand::Const(0)),
+        OpCode::Shl | OpCode::Shr if is_constant(right, 0) => Some(left.clone()),
+        OpCode::Shl | OpCode::Shr if is_constant(left, 0) => Some(Operand::Const(0)),
         _ => None,
     }
 }
@@ -336,6 +405,8 @@ fn evaluate(operation: OpCode, left: i32, right: i32) -> Option<i32> {
         OpCode::Mul => Some(left.wrapping_mul(right)),
         OpCode::Div if right != 0 => Some(left.wrapping_div(right)),
         OpCode::Mod if right != 0 => Some(left.wrapping_rem(right)),
+        OpCode::Shl if (0..32).contains(&right) => Some(left.wrapping_shl(right as u32)),
+        OpCode::Shr if (0..32).contains(&right) => Some(left.wrapping_shr(right as u32)),
         _ => None,
     }
 }
@@ -349,7 +420,13 @@ fn replace_with_assignment(instruction: &mut Instruction, value: Operand) {
 fn is_binary(operation: OpCode) -> bool {
     matches!(
         operation,
-        OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod
+        OpCode::Add
+            | OpCode::Sub
+            | OpCode::Mul
+            | OpCode::Div
+            | OpCode::Mod
+            | OpCode::Shl
+            | OpCode::Shr
     )
 }
 
@@ -361,6 +438,8 @@ fn instruction_uses_arg1(operation: OpCode) -> bool {
             | OpCode::Mul
             | OpCode::Div
             | OpCode::Mod
+            | OpCode::Shl
+            | OpCode::Shr
             | OpCode::Assign
             | OpCode::IfFalse
             | OpCode::Print
@@ -410,17 +489,19 @@ impl DefUseChains {
                 let instruction = instruction_by_id[instruction_id];
                 for operand in used_operands(instruction) {
                     if let Some(key) = operand_key(operand)
-                        && let Some(definition_id) = last_definition.get(&key) {
-                            consumers_by_definition
-                                .entry(*definition_id)
-                                .or_insert_with(Vec::new)
-                                .push(*instruction_id);
-                        }
+                        && let Some(definition_id) = last_definition.get(&key)
+                    {
+                        consumers_by_definition
+                            .entry(*definition_id)
+                            .or_insert_with(Vec::new)
+                            .push(*instruction_id);
+                    }
                 }
                 if defines_destination(instruction)
-                    && let Some(key) = operand_key(&instruction.dest) {
-                        last_definition.insert(key, *instruction_id);
-                    }
+                    && let Some(key) = operand_key(&instruction.dest)
+                {
+                    last_definition.insert(key, *instruction_id);
+                }
             }
         }
 
@@ -536,6 +617,7 @@ impl ValueNumberState {
         };
 
         self.remove_destination_representative(&instruction.dest);
+
         if let Some(representative) = self.expressions.get(&expression).cloned() {
             let before = instruction.clone();
             replace_with_assignment(instruction, representative.clone());
@@ -632,23 +714,23 @@ pub fn eliminate_dead_code(program: &mut Program) -> Vec<Transformation> {
             {
                 continue;
             }
-
             if defines_destination(inst)
                 && let Some(dest_key) = operand_key(&inst.dest)
-                    && !used.contains(&dest_key) {
-                        let before = inst.clone();
-                        inst.op = OpCode::Nop;
-                        inst.arg1 = Operand::None;
-                        inst.arg2 = Operand::None;
-                        inst.dest = Operand::None;
-                        transformations.push(Transformation {
-                            pass: OptimizationKind::DeadCodeElimination,
-                            instruction_id: inst.id,
-                            before,
-                            after: inst.clone(),
-                        });
-                        changed = true;
-                    }
+                && !used.contains(&dest_key)
+            {
+                let before = inst.clone();
+                inst.op = OpCode::Nop;
+                inst.arg1 = Operand::None;
+                inst.arg2 = Operand::None;
+                inst.dest = Operand::None;
+                transformations.push(Transformation {
+                    pass: OptimizationKind::DeadCodeElimination,
+                    instruction_id: inst.id,
+                    before,
+                    after: inst.clone(),
+                });
+                changed = true;
+            }
         }
 
         if changed {
@@ -658,4 +740,3 @@ pub fn eliminate_dead_code(program: &mut Program) -> Vec<Transformation> {
 
     transformations
 }
-

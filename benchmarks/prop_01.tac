@@ -2,3 +2,4 @@
 k = 42
 read x
 t1 = x + k
+print t1

@@ -13,7 +13,7 @@ use crate::tui::{
     theme::{
         COLOR_BORDER_ACTIVE, COLOR_BORDER, COLOR_CYAN, COLOR_INDIGO,
         COLOR_PINK, COLOR_SUCCESS, COLOR_TEXT_BODY, COLOR_TEXT_HEAD,
-        COLOR_TEXT_MUTED, COLOR_WARNING,
+        COLOR_TEXT_MUTED,
     },
 };
 
@@ -39,58 +39,28 @@ pub fn render_home(frame: &mut Frame, app: &App, area: Rect) {
 fn render_ascii_hero(frame: &mut Frame, _app: &App, area: Rect) {
     let banner = vec![
         Line::from(vec![
-            Span::styled("  ██████╗ ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled("██████╗ ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled("██████╗ ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
-            Span::styled("███████╗", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
-            Span::styled(" ██████╗ ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-            Span::styled("██████╗ ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-            Span::styled("████████╗", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(" ██████╗ ██████╗ ██████╗ ███████╗", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(" ██████╗ ██████╗ ████████╗", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
-            Span::styled(" ██╔════╝", Style::default().fg(COLOR_CYAN)),
-            Span::styled("██╔═══██╗", Style::default().fg(COLOR_CYAN)),
-            Span::styled("██╔══██╗", Style::default().fg(COLOR_INDIGO)),
-            Span::styled("██╔════╝", Style::default().fg(COLOR_INDIGO)),
-            Span::styled("██╔═══██╗", Style::default().fg(COLOR_PINK)),
-            Span::styled("██╔══██╗", Style::default().fg(COLOR_PINK)),
-            Span::styled("╚══██╔══╝", Style::default().fg(COLOR_CYAN)),
+            Span::styled("██╔════╝██╔═══██╗██╔══██╗██╔════╝", Style::default().fg(COLOR_CYAN)),
+            Span::styled("██╔═══██╗██╔══██╗╚══██╔══╝", Style::default().fg(COLOR_PINK)),
         ]),
         Line::from(vec![
-            Span::styled(" ██║     ", Style::default().fg(COLOR_CYAN)),
-            Span::styled("██║   ██║", Style::default().fg(COLOR_CYAN)),
-            Span::styled("██║  ██║", Style::default().fg(COLOR_INDIGO)),
-            Span::styled("█████╗  ", Style::default().fg(COLOR_INDIGO)),
-            Span::styled("██║   ██║", Style::default().fg(COLOR_PINK)),
-            Span::styled("██████╔╝", Style::default().fg(COLOR_PINK)),
-            Span::styled("   ██║   ", Style::default().fg(COLOR_CYAN)),
+            Span::styled("██║     ██║   ██║██║  ██║█████╗  ", Style::default().fg(COLOR_INDIGO)),
+            Span::styled("██║   ██║██████╔╝   ██║   ", Style::default().fg(COLOR_PINK)),
         ]),
         Line::from(vec![
-            Span::styled(" ██║     ", Style::default().fg(COLOR_CYAN)),
-            Span::styled("██║   ██║", Style::default().fg(COLOR_CYAN)),
-            Span::styled("██║  ██║", Style::default().fg(COLOR_INDIGO)),
-            Span::styled("██╔══╝  ", Style::default().fg(COLOR_INDIGO)),
-            Span::styled("██║   ██║", Style::default().fg(COLOR_PINK)),
-            Span::styled("██╔═══╝ ", Style::default().fg(COLOR_PINK)),
-            Span::styled("   ██║   ", Style::default().fg(COLOR_CYAN)),
+            Span::styled("██║     ██║   ██║██║  ██║██╔══╝  ", Style::default().fg(COLOR_INDIGO)),
+            Span::styled("██║   ██║██╔═══╝    ██║   ", Style::default().fg(COLOR_PINK)),
         ]),
         Line::from(vec![
-            Span::styled(" ╚██████╗", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled("╚██████╔╝", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled("██████╔╝", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
-            Span::styled("███████╗", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
-            Span::styled("╚██████╔╝", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-            Span::styled("██║     ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-            Span::styled("   ██║   ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled("╚██████╗╚██████╔╝██████╔╝███████╗", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled("╚██████╔╝██║        ██║   ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
-            Span::styled("  ╚═════╝ ", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled("╚═════╝ ", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled("╚═════╝ ", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled("╚══════╝", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled(" ╚═════╝ ", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled("╚═╝     ", Style::default().fg(COLOR_TEXT_MUTED)),
-            Span::styled("   ╚═╝   ", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled(" ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled(" ╚═════╝ ╚═╝        ╚═╝   ", Style::default().fg(COLOR_TEXT_MUTED)),
         ]),
     ];
 
@@ -151,7 +121,7 @@ fn render_launcher_cards(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(border_color_1))
         .title(Line::from(vec![
             Span::styled(
-                if is_playground_active { " ▶ [1] Interactive Playground " } else { "   [1] Interactive Playground " },
+                " ▶ [1] Interactive Playground ",
                 Style::default().fg(if is_playground_active { COLOR_CYAN } else { COLOR_TEXT_HEAD }).add_modifier(Modifier::BOLD),
             ),
         ]));
@@ -177,10 +147,11 @@ fn render_launcher_cards(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            if is_playground_active { ">> Press [Enter] or [1] to Launch Playground <<" } else { "   Select with [←] or press [1]   " },
+            if is_playground_active { ">> Press [Enter] or [1] to Launch Playground <<" } else { "   Select with [←/→] or press [1]   " },
             Style::default().fg(if is_playground_active { COLOR_SUCCESS } else { COLOR_TEXT_MUTED }).add_modifier(Modifier::BOLD),
         )),
     ];
+
     let widget_1 = Paragraph::new(content_1).block(block_1);
     frame.render_widget(widget_1, cards[0]);
 
@@ -202,7 +173,7 @@ fn render_launcher_cards(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(border_color_2))
         .title(Line::from(vec![
             Span::styled(
-                if is_benchmark_active { " ▶ [2] Benchmark Suite & Datasets " } else { "   [2] Benchmark Suite & Datasets " },
+                " ▶ [2] Benchmark Suite & Datasets ",
                 Style::default().fg(if is_benchmark_active { COLOR_PINK } else { COLOR_TEXT_HEAD }).add_modifier(Modifier::BOLD),
             ),
         ]));
@@ -217,7 +188,7 @@ fn render_launcher_cards(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled(" • [Categorized Dropdowns]: ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-            Span::styled("CF, CP, AS, CSE, and ★ Combined ★", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled("CF, CP, AS, CSE, DCE, SR & ★ Combined ★", Style::default().fg(COLOR_TEXT_MUTED)),
         ]),
         Line::from(vec![
             Span::styled(" • [Execution Time Score]: ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
@@ -229,10 +200,11 @@ fn render_launcher_cards(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            if is_benchmark_active { ">> Press [Enter] or [2] to Launch Benchmark Suite <<" } else { "   Select with [→] or press [2]   " },
+            if is_benchmark_active { ">> Press [Enter] or [2] to Launch Benchmark Suite <<" } else { "   Select with [←/→] or press [2]   " },
             Style::default().fg(if is_benchmark_active { COLOR_SUCCESS } else { COLOR_TEXT_MUTED }).add_modifier(Modifier::BOLD),
         )),
     ];
+
     let widget_2 = Paragraph::new(content_2).block(block_2);
     frame.render_widget(widget_2, cards[1]);
 }
@@ -251,11 +223,11 @@ fn render_telemetry(frame: &mut Frame, _app: &App, area: Rect) {
         Span::styled("[CP: Ready] ", Style::default().fg(COLOR_SUCCESS)),
         Span::styled("[AS: Ready] ", Style::default().fg(COLOR_SUCCESS)),
         Span::styled("[CSE: Ready] ", Style::default().fg(COLOR_SUCCESS)),
-        Span::styled("[SR: Staged] ", Style::default().fg(COLOR_WARNING)),
-        Span::styled("[DCE: Staged] ", Style::default().fg(COLOR_WARNING)),
-        Span::styled(" │ VM: ", Style::default().fg(COLOR_TEXT_MUTED)),
+        Span::styled("[SR: Ready] ", Style::default().fg(COLOR_SUCCESS)),
+        Span::styled("[DCE: Ready] ", Style::default().fg(COLOR_SUCCESS)),
+        Span::styled(" | VM: ", Style::default().fg(COLOR_TEXT_MUTED)),
         Span::styled("32-bit Signed Wrapping ", Style::default().fg(COLOR_CYAN)),
-        Span::styled(" │ Verification: ", Style::default().fg(COLOR_TEXT_MUTED)),
+        Span::styled(" | Verification: ", Style::default().fg(COLOR_TEXT_MUTED)),
         Span::styled("Differential Equivalence", Style::default().fg(COLOR_SUCCESS)),
     ]);
 
@@ -267,7 +239,7 @@ fn render_footer(frame: &mut Frame, area: Rect) {
     let text = Line::from(vec![
         Span::styled(" [1/2] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         Span::styled("Select Mode  ", Style::default().fg(COLOR_TEXT_BODY)),
-        Span::styled(" [Tab / ← / →] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(" [Tab / ←→] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         Span::styled("Switch Card  ", Style::default().fg(COLOR_TEXT_BODY)),
         Span::styled(" [Enter] ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
         Span::styled("Launch  ", Style::default().fg(COLOR_TEXT_BODY)),
@@ -276,7 +248,6 @@ fn render_footer(frame: &mut Frame, area: Rect) {
         Span::styled(" [Q / Esc] ", Style::default().fg(COLOR_TEXT_MUTED).add_modifier(Modifier::BOLD)),
         Span::styled("Quit", Style::default().fg(COLOR_TEXT_MUTED)),
     ]);
-
     let widget = Paragraph::new(text).alignment(Alignment::Center);
     frame.render_widget(widget, area);
 }

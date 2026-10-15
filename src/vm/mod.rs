@@ -60,7 +60,7 @@ pub fn execute_with_step_limit(
 
         let instruction = &program.instructions[program_counter];
         match instruction.op {
-            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod => {
+            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Shl | OpCode::Shr => {
                 let left = value(&instruction.arg1, &memory, instruction.id)?;
                 let right = value(&instruction.arg2, &memory, instruction.id)?;
                 let result = match instruction.op {
@@ -78,6 +78,18 @@ pub fn execute_with_step_limit(
                             return Err(error(Some(instruction.id), "remainder by zero"));
                         }
                         left.wrapping_rem(right)
+                    }
+                    OpCode::Shl => {
+                        if right < 0 || right >= 32 {
+                            return Err(error(Some(instruction.id), "shift amount out of range"));
+                        }
+                        left.wrapping_shl(right as u32)
+                    }
+                    OpCode::Shr => {
+                        if right < 0 || right >= 32 {
+                            return Err(error(Some(instruction.id), "shift amount out of range"));
+                        }
+                        left.wrapping_shr(right as u32)
                     }
                     _ => unreachable!("only binary operations reach this branch"),
                 };

@@ -2,3 +2,4 @@
 scale = 10
 read y
 t1 = y - scale
+print t1

@@ -3,3 +3,5 @@ read m
 read n
 t1 = m * n
 t2 = n * m
+print t1
+print t2
