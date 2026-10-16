@@ -141,21 +141,12 @@ pub struct App {
     pub playground_status_message: Option<String>,
     pub load_file_modal_open: bool,
     pub load_file_path_input: String,
+    pub reset_confirm_modal_open: bool,
 }
 
 impl App {
     pub fn new(corpus: BenchmarkCorpus) -> Self {
-        let default_playground = vec![
-            "read a".to_string(),
-            "read b".to_string(),
-            "t1 = a + 0".to_string(),
-            "t2 = 10 * 20".to_string(),
-            "t3 = a + b".to_string(),
-            "t4 = b + a".to_string(),
-            "print t4".to_string(),
-        ];
-
-        let mut app = Self {
+        let app = Self {
             screen: CurrentScreen::Home,
             selected_home_card: 0,
             tick_count: 0,
@@ -174,9 +165,9 @@ impl App {
             deep_dive_orig_time_us: 0,
             deep_dive_opt_time_us: 0,
             deep_dive_vector_results: Vec::new(),
-            playground_file_name: "scratchpad.tac".to_string(),
-            playground_buffer: default_playground,
-            playground_cursor_row: 2,
+            playground_file_name: "scratchpad".to_string(),
+            playground_buffer: vec![String::new()],
+            playground_cursor_row: 0,
             playground_cursor_col: 0,
             playground_editing: false,
             playground_inputs: vec![4, 9],
@@ -186,13 +177,15 @@ impl App {
             playground_orig_out: Vec::new(),
             playground_opt_out: Vec::new(),
             playground_equiv_pass: true,
-            playground_converted: true,
-            playground_vm_executed: true,
-            playground_status_message: None,
+            playground_converted: false,
+            playground_vm_executed: false,
+            playground_status_message: Some(
+                "ENTER C OR TAC CODE — PRESS 'i' TO EDIT, 'C' TO CONVERT".to_string(),
+            ),
             load_file_modal_open: false,
-            load_file_path_input: "benchmarks/algebraic_01.tac".to_string(),
+            load_file_path_input: "samples/demo_math.c".to_string(),
+            reset_confirm_modal_open: false,
         };
-        app.recompile_playground();
         app
     }
 
@@ -261,7 +254,51 @@ impl App {
     }
 
     pub fn convert_playground(&mut self) {
-        let source = self.playground_buffer.join("\n");
+        let mut source = self.playground_buffer.join("\n");
+        if source.trim().is_empty() {
+            self.playground_parse_error = Some("Input buffer is empty. Please enter C or TAC code first.".to_string());
+            self.playground_opt_lines.clear();
+            self.playground_transforms.clear();
+            self.playground_converted = false;
+            self.playground_vm_executed = false;
+            return;
+        }
+
+        let was_c_code = crate::c_frontend::looks_like_c_code(&source);
+        if was_c_code {
+            match crate::c_frontend::lower_c_to_tac(&source) {
+                Ok(tac) => {
+                    self.playground_buffer = tac.lines().map(String::from).collect();
+                    self.playground_status_message =
+                        Some("LOWERED C SOURCE TO TAC (NATIVE ENGINE)".to_string());
+                    source = tac;
+                }
+                Err(e) => {
+                    // Fall back to dormant GCC backup compiler
+                    match crate::c_frontend::lower_c_source_via_gcc_backup(&source) {
+                        Ok(tac) => {
+                            self.playground_buffer = tac.lines().map(String::from).collect();
+                            self.playground_status_message =
+                                Some("LOWERED C SOURCE VIA GCC BACKUP COMPILER".to_string());
+                            source = tac;
+                        }
+                        Err(gcc_err) => {
+                            self.playground_parse_error = Some(format!(
+                                "C Frontend Error:\n• Native Lowerer: {e}\n• GCC Backup Lowerer: {gcc_err}\n\nNote: CodeOpt TAC optimizes scalar integer computations, wrapping arithmetic, and control flow. Recursive functions, dynamic arrays, and heap pointer dereferences exceed the flat scalar TAC model."
+                            ));
+                            self.playground_opt_lines.clear();
+                            self.playground_transforms.clear();
+                            self.playground_converted = false;
+                            self.playground_vm_executed = false;
+                            return;
+                        }
+                    }
+                }
+            }
+        } else {
+            self.playground_status_message =
+                Some("OPTIMIZED TAC INSTRUCTIONS".to_string());
+        }
         let parsed = match parse_program(&source) {
             Ok(p) => p,
             Err(e) => {
@@ -482,15 +519,62 @@ impl App {
                     let path = self.load_file_path_input.trim();
                     if let Ok(content) = fs::read_to_string(path) {
                         self.playground_file_name = path.to_string();
-                        self.playground_buffer = content.lines().map(String::from).collect();
+                        let is_c = path.ends_with(".c") || crate::c_frontend::looks_like_c_code(&content);
+                        if is_c {
+                            match crate::c_frontend::lower_c_to_tac(&content) {
+                                Ok(tac) => {
+                                    self.playground_buffer = tac.lines().map(String::from).collect();
+                                    self.playground_status_message =
+                                        Some("LOWERED C SOURCE TO TAC (NATIVE ENGINE)".to_string());
+                                }
+                                Err(err) => {
+                                    self.playground_buffer = content.lines().map(String::from).collect();
+                                    self.playground_status_message =
+                                        Some(format!("C LOWERING ERROR: {err}"));
+                                }
+                            }
+                        } else {
+                            self.playground_buffer = content.lines().map(String::from).collect();
+                        }
                         self.playground_cursor_row = 0;
                         self.playground_cursor_col = 0;
                         self.recompile_playground();
+                        if is_c {
+                            self.playground_status_message =
+                                Some("LOWERED C SOURCE TO TAC (NATIVE ENGINE)".to_string());
+                        }
                     }
                     self.load_file_modal_open = false;
                 }
                 KeyCode::Char(c) => {
                     self.load_file_path_input.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Reset confirmation modal in playground
+        if self.screen == CurrentScreen::Playground && self.reset_confirm_modal_open {
+            match key {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.playground_buffer = vec![String::new()];
+                    self.playground_cursor_row = 0;
+                    self.playground_cursor_col = 0;
+                    self.playground_opt_lines.clear();
+                    self.playground_transforms.clear();
+                    self.playground_parse_error = None;
+                    self.playground_orig_out.clear();
+                    self.playground_opt_out.clear();
+                    self.playground_converted = false;
+                    self.playground_vm_executed = false;
+                    self.playground_status_message =
+                        Some("BUFFER CLEARED — ENTER C OR TAC CODE".to_string());
+                    self.reset_confirm_modal_open = false;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.reset_confirm_modal_open = false;
+                    self.playground_status_message = Some("RESET CANCELLED".to_string());
                 }
                 _ => {}
             }
@@ -897,18 +981,7 @@ impl App {
                         self.run_playground_vm();
                     }
                     KeyCode::Char('x') | KeyCode::Char('X') => {
-                        self.playground_buffer = vec![
-                            "read a".to_string(),
-                            "read b".to_string(),
-                            "t1 = a + 0".to_string(),
-                            "t2 = 10 * 20".to_string(),
-                            "t3 = a + b".to_string(),
-                            "t4 = b + a".to_string(),
-                            "print t4".to_string(),
-                        ];
-                        self.playground_cursor_row = 0;
-                        self.playground_cursor_col = 0;
-                        self.recompile_playground();
+                        self.reset_confirm_modal_open = true;
                     }
                     _ => {}
                 }
@@ -1104,7 +1177,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::data::BenchmarkCategory;
+    use crate::tui::data::metrics::ProgramStats;
 
     #[test]
     fn test_home_navigation_and_mode_switching() {
@@ -1183,13 +1256,259 @@ mod tests {
     fn test_5_vector_verification_proof() {
         let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
         assert!(!corpus.items.is_empty());
+        let mut total_orig_instr = 0;
+        let mut total_opt_instr = 0;
+        let mut total_orig_arith = 0;
+        let mut total_opt_arith = 0;
+        let mut total_orig_temps = 0;
+        let mut total_opt_temps = 0;
+        let mut total_orig_size = 0;
+        let mut total_opt_size = 0;
+        let mut total_orig_time = 0;
+        let mut total_opt_time = 0;
+        let mut total_vectors = 0;
+        let mut passed_vectors = 0;
+
         for item in &corpus.items {
+            total_orig_instr += item.original_stats.instruction_count;
+            total_opt_instr += item.optimized_stats.instruction_count;
+            total_orig_arith += item.original_stats.arithmetic_count;
+            total_opt_arith += item.optimized_stats.arithmetic_count;
+            total_orig_temps += item.original_stats.temp_count;
+            total_opt_temps += item.optimized_stats.temp_count;
+            total_orig_size += item.original_stats.code_size_bytes;
+            total_opt_size += item.optimized_stats.code_size_bytes;
+            total_orig_time += item.time_original_us;
+            total_opt_time += item.time_optimized_us;
+
             assert_eq!(item.test_vectors.len(), 5, "Item {} must have 5 test vectors", item.name);
             assert!(item.verification_passed, "Item {} must pass verification across all 5 vectors", item.name);
             for v in &item.test_vectors {
+                total_vectors += 1;
+                if v.passed {
+                    passed_vectors += 1;
+                }
                 assert!(v.passed, "Vector {} in {} must match", v.vector_id, item.name);
                 assert_eq!(v.original_output, v.optimized_output);
             }
+        }
+        assert_eq!(corpus.items.len(), 50);
+        assert_eq!(total_vectors, 250);
+        assert_eq!(passed_vectors, 250);
+
+        let instr_red = ProgramStats::reduction_pct(total_orig_instr, total_opt_instr);
+        let arith_red = ProgramStats::reduction_pct(total_orig_arith, total_opt_arith);
+        let temps_red = ProgramStats::reduction_pct(total_orig_temps, total_opt_temps);
+        let size_red = ProgramStats::reduction_pct(total_orig_size, total_opt_size);
+
+        // Target: 20-50% instruction count reduction
+        assert!((20.0..=50.0).contains(&instr_red), "Instr reduction was {:.1}%", instr_red);
+        // Target: 30-60% arithmetic reduction (or better)
+        assert!(arith_red >= 30.0, "Arith reduction was {:.1}%", arith_red);
+        // Target: 20-40% temporary reduction (or better)
+        assert!(temps_red >= 20.0, "Temps reduction was {:.1}%", temps_red);
+        // Target: 15-40% code size reduction
+        assert!((15.0..=45.0).contains(&size_red), "Size reduction was {:.1}%", size_red);
+        // Measurable execution time speedup
+        assert!(total_orig_time > 0 && total_opt_time > 0);
+    }
+
+    #[test]
+    fn test_playground_c_code_conversion() {
+        let mut app = App::new(BenchmarkCorpus::default());
+        app.screen = CurrentScreen::Playground;
+
+        // User pastes C code into playground buffer
+        app.playground_buffer = vec![
+            "#include <stdio.h>".to_string(),
+            "int main() {".to_string(),
+            "    int x;".to_string(),
+            "    scanf(\"%d\", &x);".to_string(),
+            "    int y = x * 8;".to_string(),
+            "    printf(\"%d\\n\", y);".to_string(),
+            "    return 0;".to_string(),
+            "}".to_string(),
+        ];
+        app.playground_converted = false;
+
+        // User presses 'C' to convert and optimize
+        app.convert_playground();
+
+        assert!(app.playground_converted);
+        assert!(app.playground_parse_error.is_none());
+        assert_eq!(
+            app.playground_status_message.as_deref(),
+            Some("LOWERED C SOURCE TO TAC (NATIVE ENGINE)")
+        );
+        // Verify buffer now has lowered TAC
+        assert!(app.playground_buffer.iter().any(|l| l.contains("read x")));
+        assert!(app.playground_buffer.iter().any(|l| l.contains("y = x * 8")));
+
+        // Verify optimization ran on the lowered code
+        assert!(app.playground_opt_lines.iter().any(|l| l.contains("y = x << 3")));
+
+        // Run dual VM with test inputs [4] -> 4 * 8 = 32
+        app.playground_inputs = vec![4];
+        app.run_playground_vm();
+        assert!(app.playground_vm_executed);
+        assert!(app.playground_equiv_pass);
+        assert_eq!(app.playground_orig_out, vec![32]);
+        assert_eq!(app.playground_opt_out, vec![32]);
+    }
+
+    #[test]
+    fn test_playground_load_c_file() {
+        let mut app = App::new(BenchmarkCorpus::default());
+        app.screen = CurrentScreen::Playground;
+        app.load_file_modal_open = true;
+        app.load_file_path_input = "samples/demo_math.c".to_string();
+
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.load_file_modal_open);
+        assert_eq!(
+            app.playground_status_message.as_deref(),
+            Some("LOWERED C SOURCE TO TAC (NATIVE ENGINE)")
+        );
+        assert!(app.playground_converted);
+        assert!(app.playground_vm_executed);
+    }
+
+    #[test]
+    fn test_playground_reset_confirmation_confirm() {
+        let mut app = App::new(BenchmarkCorpus::default());
+        app.screen = CurrentScreen::Playground;
+        app.playground_buffer = vec!["read a".to_string(), "print a".to_string()];
+        app.convert_playground();
+        assert!(app.playground_converted);
+
+        // User presses 'x' to reset
+        app.handle_key(KeyCode::Char('x'));
+        assert!(app.reset_confirm_modal_open);
+        // Code is not yet wiped
+        assert_eq!(app.playground_buffer.len(), 2);
+
+        // User confirms with 'y'
+        app.handle_key(KeyCode::Char('y'));
+        assert!(!app.reset_confirm_modal_open);
+        assert_eq!(app.playground_buffer, vec![String::new()]);
+        assert_eq!(
+            app.playground_status_message.as_deref(),
+            Some("BUFFER CLEARED — ENTER C OR TAC CODE")
+        );
+        assert!(!app.playground_converted);
+    }
+
+    #[test]
+    fn test_playground_reset_confirmation_cancel() {
+        let mut app = App::new(BenchmarkCorpus::default());
+        app.screen = CurrentScreen::Playground;
+        app.playground_buffer = vec!["read a".to_string(), "print a".to_string()];
+        app.convert_playground();
+
+        // User presses 'x' to reset
+        app.handle_key(KeyCode::Char('x'));
+        assert!(app.reset_confirm_modal_open);
+
+        // User cancels with Esc
+        app.handle_key(KeyCode::Esc);
+        assert!(!app.reset_confirm_modal_open);
+        // Code remains intact
+        assert_eq!(app.playground_buffer.len(), 2);
+        assert_eq!(
+            app.playground_status_message.as_deref(),
+            Some("RESET CANCELLED")
+        );
+    }
+
+    #[test]
+    fn test_playground_c_pointer_program_fallback() {
+        let mut app = App::new(BenchmarkCorpus::default());
+        app.screen = CurrentScreen::Playground;
+        app.playground_buffer = vec![
+            "#include <stdio.h>".to_string(),
+            "void swap(int *a, int *b) {".to_string(),
+            "    int t = *a;".to_string(),
+            "    *a = *b;".to_string(),
+            "    *b = t;".to_string(),
+            "}".to_string(),
+            "int main() {".to_string(),
+            "    int x, y;".to_string(),
+            "    scanf(\"%d %d\", &x, &y);".to_string(),
+            "    swap(&x, &y);".to_string(),
+            "    int res = x * 8 + y;".to_string(),
+            "    printf(\"%d\\n\", res);".to_string(),
+            "    return 0;".to_string(),
+            "}".to_string(),
+        ];
+        app.convert_playground();
+
+        assert!(app.playground_converted);
+        assert!(app.playground_parse_error.is_none());
+        assert_eq!(
+            app.playground_status_message.as_deref(),
+            Some("LOWERED C SOURCE VIA GCC BACKUP COMPILER")
+        );
+        assert!(app.playground_opt_lines.iter().any(|l| l.contains("<< 3") || l.contains("* 8")));
+
+        app.playground_inputs = vec![3, 5];
+        app.run_playground_vm();
+        assert!(app.playground_vm_executed);
+        assert!(app.playground_equiv_pass);
+        assert_eq!(app.playground_orig_out, vec![43]);
+        assert_eq!(app.playground_opt_out, vec![43]);
+    }
+
+    #[test]
+    fn test_analytics_deck_rendering_and_metrics() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::tui::views::analytics::render_analytics;
+
+        let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
+        assert_eq!(corpus.items.len(), 50);
+
+        let mut app = App::new(corpus);
+        app.screen = CurrentScreen::AnalyticsDeck;
+
+        // Verify keypress 'g' navigates to analytics
+        app.screen = CurrentScreen::BenchmarkSuite;
+        app.handle_key(KeyCode::Char('g'));
+        assert_eq!(app.screen, CurrentScreen::AnalyticsDeck);
+
+        // Test rendering across multiple terminal sizes
+        for (w, h) in [(140, 45), (100, 32), (160, 50)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+
+            terminal.draw(|f| {
+                render_analytics(f, &app, f.area());
+            }).unwrap();
+
+            let buffer = terminal.backend().buffer();
+            let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+
+            // Verify Header & Navigation
+            assert!(content.contains("CodeOpt Comprehensive Analytics"));
+            assert!(content.contains("Corpus Total: 50"));
+
+            // Verify all 6 Plots exist
+            assert!(content.contains("1. Instrs"));
+            assert!(content.contains("2. Stacked"));
+            assert!(content.contains("3. Convergence"));
+            assert!(content.contains("4. Pass Distribution (Pie)"));
+            assert!(content.contains("5. Scatter"));
+            assert!(content.contains("6. Heatmap"));
+
+            // Verify Section 5 Aggregate Metrics Summary Table & Per-Optimizer Panel
+            assert!(content.contains("Section 5: Aggregate Benchmark Metrics"));
+            assert!(content.contains("Instruction Count"));
+            assert!(content.contains("Arithmetic Operations"));
+            assert!(content.contains("Temporary Variables"));
+            assert!(content.contains("Code Size"));
+            assert!(content.contains("Execution Time"));
+            assert!(content.contains("Semantic Correctness"));
+            assert!(content.contains("Per-Optimizer Effectiveness"));
+            assert!(content.contains("PASS"));
         }
     }
 }

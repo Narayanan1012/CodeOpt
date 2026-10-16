@@ -18,18 +18,15 @@ fn main() {
         }
         "help" | "--help" | "-h" => {
             println!(
-                "Usage: codeopt [status | format <file.tac> | cfg <file.tac> | run <file.tac> [inputs] | optimize <file.tac> | verify <file.tac> [inputs] | tui [file.tac] [inputs]]"
+                "Usage: codeopt [status | format <file> | cfg <file> | run <file> [inputs] | optimize <file> | verify <file> [inputs] | tui [file] [inputs] | c-backup <file.c>]"
             );
         }
         "format" => {
             let Some(path) = env::args().nth(2) else {
-                eprintln!("Usage: codeopt format <file.tac>");
+                eprintln!("Usage: codeopt format <file>");
                 std::process::exit(2);
             };
-            let source = fs::read_to_string(&path).unwrap_or_else(|error| {
-                eprintln!("Could not read `{path}`: {error}");
-                std::process::exit(1);
-            });
+            let source = read_and_lower_source(&path);
             let program = parse_program(&source).unwrap_or_else(|error| {
                 eprintln!("Invalid TAC: {error}");
                 std::process::exit(1);
@@ -38,13 +35,10 @@ fn main() {
         }
         "cfg" => {
             let Some(path) = env::args().nth(2) else {
-                eprintln!("Usage: codeopt cfg <file.tac>");
+                eprintln!("Usage: codeopt cfg <file>");
                 std::process::exit(2);
             };
-            let source = fs::read_to_string(&path).unwrap_or_else(|error| {
-                eprintln!("Could not read `{path}`: {error}");
-                std::process::exit(1);
-            });
+            let source = read_and_lower_source(&path);
             let mut program = parse_program(&source).unwrap_or_else(|error| {
                 eprintln!("Invalid TAC: {error}");
                 std::process::exit(1);
@@ -62,7 +56,7 @@ fn main() {
         }
         "run" => {
             let Some(path) = env::args().nth(2) else {
-                eprintln!("Usage: codeopt run <file.tac> [inputs]");
+                eprintln!("Usage: codeopt run <file> [inputs]");
                 std::process::exit(2);
             };
             let inputs = env::args().nth(3).map_or_else(Vec::new, |raw_inputs| {
@@ -76,10 +70,7 @@ fn main() {
                     })
                     .collect()
             });
-            let source = fs::read_to_string(&path).unwrap_or_else(|error| {
-                eprintln!("Could not read `{path}`: {error}");
-                std::process::exit(1);
-            });
+            let source = read_and_lower_source(&path);
             let program = parse_program(&source).unwrap_or_else(|error| {
                 eprintln!("Invalid TAC: {error}");
                 std::process::exit(1);
@@ -94,13 +85,10 @@ fn main() {
         }
         "optimize" => {
             let Some(path) = env::args().nth(2) else {
-                eprintln!("Usage: codeopt optimize <file.tac>");
+                eprintln!("Usage: codeopt optimize <file>");
                 std::process::exit(2);
             };
-            let source = fs::read_to_string(&path).unwrap_or_else(|error| {
-                eprintln!("Could not read `{path}`: {error}");
-                std::process::exit(1);
-            });
+            let source = read_and_lower_source(&path);
             let mut program = parse_program(&source).unwrap_or_else(|error| {
                 eprintln!("Invalid TAC: {error}");
                 std::process::exit(1);
@@ -147,16 +135,13 @@ fn main() {
         }
         "verify" => {
             let Some(path) = env::args().nth(2) else {
-                eprintln!("Usage: codeopt verify <file.tac> [inputs]");
+                eprintln!("Usage: codeopt verify <file> [inputs]");
                 std::process::exit(2);
             };
             let inputs = env::args()
                 .nth(3)
                 .map_or_else(Vec::new, |raw_inputs| parse_inputs(&raw_inputs));
-            let source = fs::read_to_string(&path).unwrap_or_else(|error| {
-                eprintln!("Could not read `{path}`: {error}");
-                std::process::exit(1);
-            });
+            let source = read_and_lower_source(&path);
             let program = parse_program(&source).unwrap_or_else(|error| {
                 eprintln!("Invalid TAC: {error}");
                 std::process::exit(1);
@@ -174,10 +159,56 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "c-backup" => {
+            let Some(path) = env::args().nth(2) else {
+                eprintln!("Usage: codeopt c-backup <file.c>");
+                std::process::exit(2);
+            };
+            let tac_source = codeopt::c_frontend::lower_c_via_gcc_backup(&path).unwrap_or_else(|error| {
+                eprintln!("GCC GIMPLE backup lowerer failed: {error}");
+                std::process::exit(1);
+            });
+            println!("Extracted TAC from GCC GIMPLE:\n{tac_source}\n");
+            let mut program = parse_program(&tac_source).unwrap_or_else(|error| {
+                eprintln!("Invalid TAC produced by GIMPLE lowerer: {error}");
+                std::process::exit(1);
+            });
+            let cfg = build(&mut program).unwrap_or_else(|error| {
+                eprintln!("Invalid control flow: {error}");
+                std::process::exit(1);
+            });
+            let report = optimize_with_worklist(&mut program, &cfg);
+            println!("Optimization Report ({} passes fired):", report.transformations.len());
+            for transformation in report.transformations {
+                println!(
+                    "{:?} [instruction {}]: {} => {}",
+                    transformation.pass,
+                    transformation.instruction_id,
+                    transformation.before,
+                    transformation.after
+                );
+            }
+            println!("\nOptimized TAC:\n{program}");
+        }
         other => {
             eprintln!("Unknown command: {other}. Run `codeopt help`.");
             std::process::exit(2);
         }
+    }
+}
+
+fn read_and_lower_source(path: &str) -> String {
+    let raw = fs::read_to_string(path).unwrap_or_else(|error| {
+        eprintln!("Could not read `{path}`: {error}");
+        std::process::exit(1);
+    });
+    if path.ends_with(".c") || codeopt::c_frontend::looks_like_c_code(&raw) {
+        codeopt::c_frontend::lower_c_to_tac(&raw).unwrap_or_else(|error| {
+            eprintln!("C frontend lowering failed: {error}");
+            std::process::exit(1);
+        })
+    } else {
+        raw
     }
 }
 

@@ -33,7 +33,9 @@ pub fn render_playground(frame: &mut Frame, app: &App, area: Rect) {
     render_playground_bottom(frame, app, chunks[2]);
     render_playground_footer(frame, chunks[3]);
 
-    if app.load_file_modal_open {
+    if app.reset_confirm_modal_open {
+        render_reset_confirm_modal(frame, area);
+    } else if app.load_file_modal_open {
         render_load_path_modal(frame, app, area);
     }
 }
@@ -44,9 +46,12 @@ fn render_playground_header(frame: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(COLOR_BORDER_ACTIVE))
         .title(Line::from(vec![
-            Span::styled(" CodeOpt Interactive TAC Playground ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(" CodeOpt Interactive Playground (C & TAC) ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
             Span::styled(format!("— Source: {} ", app.playground_file_name), Style::default().fg(COLOR_TEXT_HEAD)),
         ]));
+
+    let is_empty_buffer = app.playground_buffer.is_empty()
+        || (app.playground_buffer.len() == 1 && app.playground_buffer[0].trim().is_empty());
 
     let mut header_spans = vec![
         Span::styled(" Live Editor & Real-Time Optimizer  ", Style::default().fg(COLOR_TEXT_MUTED)),
@@ -56,10 +61,12 @@ fn render_playground_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" │ Status: ", Style::default().fg(COLOR_TEXT_MUTED)),
         if app.playground_parse_error.is_some() {
             Span::styled("SYNTAX ERROR", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))
+        } else if is_empty_buffer {
+            Span::styled("AWAITING INPUT — TYPE C OR TAC CODE", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD))
         } else if !app.playground_converted {
-            Span::styled("MODIFIED — [C] CONVERT", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD))
+            Span::styled("READY TO CONVERT — PRESS [C]", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD))
         } else if !app.playground_vm_executed {
-            Span::styled("CONVERTED — [R] RUN VM", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD))
+            Span::styled("CONVERTED & OPTIMIZED — PRESS [R] TO RUN VM", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD))
         } else {
             Span::styled("OPTIMIZED & VERIFIED", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
         },
@@ -80,70 +87,117 @@ fn render_playground_editor(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
+    let is_empty_buffer = app.playground_buffer.is_empty()
+        || (app.playground_buffer.len() == 1 && app.playground_buffer[0].is_empty());
+
     // Left Pane: In-place Input Buffer
     let buffer_block = Block::default()
         .borders(Borders::ALL)
         .border_type(if app.playground_editing { BorderType::Thick } else { BorderType::Rounded })
         .border_style(Style::default().fg(if app.playground_editing { COLOR_BORDER_ACTIVE } else { COLOR_BORDER }))
         .title(Line::from(vec![
-            Span::styled(" Input TAC Buffer ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(" Input Buffer (C or TAC) ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
             Span::styled(format!("({} lines) ", app.playground_buffer.len()), Style::default().fg(COLOR_TEXT_MUTED)),
             Span::styled(if app.playground_editing { "● REC" } else { "" }, Style::default().fg(COLOR_DANGER)),
         ]));
 
-    let buffer_lines: Vec<Line> = app
-        .playground_buffer
-        .iter()
-        .enumerate()
-        .map(|(idx, line)| {
-            let is_cursor_line = idx == app.playground_cursor_row;
-            let cursor_prefix = if is_cursor_line {
-                Span::styled("▶ ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD))
-            } else {
-                Span::raw("  ")
-            };
-            let line_num = Span::styled(format!("{:>2}: ", idx + 1), Style::default().fg(COLOR_TEXT_MUTED));
+    let buffer_lines: Vec<Line> = if is_empty_buffer && !app.playground_editing {
+        vec![
+            Line::from(vec![
+                Span::styled("▶ ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+                Span::styled(" 1: ", Style::default().fg(COLOR_TEXT_MUTED)),
+                Span::styled("/* Enter your C code or TAC instructions here */", Style::default().fg(COLOR_TEXT_MUTED)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("  ┌────────────────────────────────────────────────────────┐", Style::default().fg(COLOR_BORDER))),
+            Line::from(Span::styled("  │  Quick Start Guide:                                    │", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("  │                                                        │", Style::default().fg(COLOR_BORDER))),
+            Line::from(vec![
+                Span::styled("  │  • Press ", Style::default().fg(COLOR_BORDER)),
+                Span::styled("[i]", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+                Span::styled(" to enter edit mode and start typing.        │", Style::default().fg(COLOR_TEXT_BODY)),
+            ]),
+            Line::from(vec![
+                Span::styled("  │  • Press ", Style::default().fg(COLOR_BORDER)),
+                Span::styled("[Ctrl+V]", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+                Span::styled(" or ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("[p]", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+                Span::styled(" to paste C or TAC code.         │", Style::default().fg(COLOR_TEXT_BODY)),
+            ]),
+            Line::from(vec![
+                Span::styled("  │  • Press ", Style::default().fg(COLOR_BORDER)),
+                Span::styled("[L]", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
+                Span::styled(" to load a sample .c or .tac file.            │", Style::default().fg(COLOR_TEXT_BODY)),
+            ]),
+            Line::from(vec![
+                Span::styled("  │  • Press ", Style::default().fg(COLOR_BORDER)),
+                Span::styled("[C]", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+                Span::styled(" to convert C code to TAC & optimize it.    │", Style::default().fg(COLOR_TEXT_BODY)),
+            ]),
+            Line::from(vec![
+                Span::styled("  │  • Press ", Style::default().fg(COLOR_BORDER)),
+                Span::styled("[R]", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+                Span::styled(" to run both in dual VM & verify output.    │", Style::default().fg(COLOR_TEXT_BODY)),
+            ]),
+            
+            Line::from(Span::styled("  └────────────────────────────────────────────────────────┘", Style::default().fg(COLOR_BORDER))),
+        ]
+    } else {
+        app.playground_buffer
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| {
+                let is_cursor_line = idx == app.playground_cursor_row;
+                let cursor_prefix = if is_cursor_line {
+                    Span::styled("▶ ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::raw("  ")
+                };
+                let line_num = Span::styled(format!("{:>2}: ", idx + 1), Style::default().fg(COLOR_TEXT_MUTED));
 
-            if is_cursor_line && app.playground_editing {
-                let char_count = line.chars().count();
-                let col = app.playground_cursor_col.min(char_count);
-                let before: String = line.chars().take(col).collect();
-                let cursor_ch: String = line.chars().skip(col).take(1).collect();
-                let after: String = line.chars().skip(col + 1).collect();
-                let cursor_display = if cursor_ch.is_empty() { " ".to_string() } else { cursor_ch };
-                Line::from(vec![
-                    cursor_prefix,
-                    line_num,
-                    Span::styled(before, Style::default().fg(COLOR_TEXT_HEAD)),
-                    Span::styled(cursor_display, Style::default().fg(COLOR_PANEL_BG).bg(COLOR_CYAN)),
-                    Span::styled(after, Style::default().fg(COLOR_TEXT_HEAD)),
-                ])
-            } else {
-                let mut spans = vec![
-                    cursor_prefix,
-                    line_num,
-                    Span::styled(line, Style::default().fg(if is_cursor_line { COLOR_TEXT_HEAD } else { COLOR_TEXT_BODY })),
-                ];
-                if is_cursor_line && !app.playground_editing {
-                    // Show a dim underline cursor in nav mode
+                if is_cursor_line && app.playground_editing {
                     let char_count = line.chars().count();
                     let col = app.playground_cursor_col.min(char_count);
-                    // Rebuild with cursor highlight for nav mode too
-                    spans.clear();
                     let before: String = line.chars().take(col).collect();
                     let cursor_ch: String = line.chars().skip(col).take(1).collect();
                     let after: String = line.chars().skip(col + 1).collect();
                     let cursor_display = if cursor_ch.is_empty() { " ".to_string() } else { cursor_ch };
-                    spans.push(Span::styled("▶ ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)));
-                    spans.push(Span::styled(format!("{:>2}: ", idx + 1), Style::default().fg(COLOR_TEXT_MUTED)));
-                    spans.push(Span::styled(before, Style::default().fg(COLOR_TEXT_HEAD)));
-                    spans.push(Span::styled(cursor_display, Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::UNDERLINED)));
-                    spans.push(Span::styled(after, Style::default().fg(COLOR_TEXT_HEAD)));
+                    let mut spans = vec![
+                        cursor_prefix,
+                        line_num,
+                        Span::styled(before, Style::default().fg(COLOR_TEXT_HEAD)),
+                        Span::styled(cursor_display, Style::default().fg(COLOR_PANEL_BG).bg(COLOR_CYAN)),
+                        Span::styled(after, Style::default().fg(COLOR_TEXT_HEAD)),
+                    ];
+                    if line.is_empty() && idx == 0 {
+                        spans.push(Span::styled("  // Type C code (e.g. int main()...) or TAC instructions here...", Style::default().fg(COLOR_TEXT_MUTED)));
+                    }
+                    Line::from(spans)
+                } else {
+                    let mut spans = vec![
+                        cursor_prefix,
+                        line_num,
+                        Span::styled(line, Style::default().fg(if is_cursor_line { COLOR_TEXT_HEAD } else { COLOR_TEXT_BODY })),
+                    ];
+                    if is_cursor_line && !app.playground_editing {
+                        let char_count = line.chars().count();
+                        let col = app.playground_cursor_col.min(char_count);
+                        spans.clear();
+                        let before: String = line.chars().take(col).collect();
+                        let cursor_ch: String = line.chars().skip(col).take(1).collect();
+                        let after: String = line.chars().skip(col + 1).collect();
+                        let cursor_display = if cursor_ch.is_empty() { " ".to_string() } else { cursor_ch };
+                        spans.push(Span::styled("▶ ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)));
+                        spans.push(Span::styled(format!("{:>2}: ", idx + 1), Style::default().fg(COLOR_TEXT_MUTED)));
+                        spans.push(Span::styled(before, Style::default().fg(COLOR_TEXT_HEAD)));
+                        spans.push(Span::styled(cursor_display, Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::UNDERLINED)));
+                        spans.push(Span::styled(after, Style::default().fg(COLOR_TEXT_HEAD)));
+                    }
+                    Line::from(spans)
                 }
-                Line::from(spans)
-            }
-        })
-        .collect();
+            })
+            .collect()
+    };
 
     let buffer_widget = Paragraph::new(buffer_lines)
         .block(buffer_block)
@@ -166,20 +220,30 @@ fn render_playground_editor(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(Span::styled("Parse / Validation Error:", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))),
             Line::from(Span::styled(error, Style::default().fg(COLOR_WARNING))),
             Line::from(""),
-            Line::from(Span::styled("Expected syntax examples:", Style::default().fg(COLOR_TEXT_MUTED))),
-            Line::from(Span::styled("  read x", Style::default().fg(COLOR_TEXT_BODY))),
-            Line::from(Span::styled("  t1 = x + 0", Style::default().fg(COLOR_TEXT_BODY))),
-            Line::from(Span::styled("  t2 = 10 * 20", Style::default().fg(COLOR_TEXT_BODY))),
-            Line::from(Span::styled("  print t1", Style::default().fg(COLOR_TEXT_BODY))),
+            Line::from(Span::styled("Supported inputs:", Style::default().fg(COLOR_TEXT_MUTED))),
+            Line::from(Span::styled("  • C code: int a = (b * 8) + 1; scanf(\"%d\", &x); printf(\"%d\", a);", Style::default().fg(COLOR_TEXT_BODY))),
+            Line::from(Span::styled("  • TAC code: read a, t1 = a * 8, print t1", Style::default().fg(COLOR_TEXT_BODY))),
         ];
         Paragraph::new(err_lines).block(opt_block)
     } else if !app.playground_converted {
-        let pending_lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(" [Buffer Modified] ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD))),
-            Line::from(""),
-            Line::from(Span::styled(" Press [C] to run optimization pipeline and generate optimized TAC.", Style::default().fg(COLOR_TEXT_BODY))),
-        ];
+        let pending_lines = if is_empty_buffer {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(" [Awaiting C or TAC Code] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from(Span::styled(" 1. Type or paste your C source code or TAC instructions on the left.", Style::default().fg(COLOR_TEXT_HEAD))),
+                Line::from(Span::styled(" 2. Press [C] to convert C code into TAC and run optimization passes.", Style::default().fg(COLOR_TEXT_BODY))),
+                Line::from(Span::styled(" 3. Optimized TAC and pass transformations will appear here live!", Style::default().fg(COLOR_SUCCESS))),
+                Line::from(Span::styled(" 4. Press [R] to execute both codes in the VM and verify outputs.", Style::default().fg(COLOR_TEXT_BODY))),
+            ]
+        } else {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(" [Code Ready — Press [C] to Convert & Optimize] ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from(Span::styled(" Press [C] to lower C code into TAC and run the optimization pipeline.", Style::default().fg(COLOR_TEXT_BODY))),
+            ]
+        };
         Paragraph::new(pending_lines).block(opt_block)
     } else {
         let opt_lines: Vec<Line> = app
@@ -205,6 +269,9 @@ fn render_playground_bottom(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
+    let is_empty_buffer = app.playground_buffer.is_empty()
+        || (app.playground_buffer.len() == 1 && app.playground_buffer[0].is_empty());
+
     // Left: Live Rewrites
     let rewrites_block = Block::default()
         .borders(Borders::ALL)
@@ -216,7 +283,9 @@ fn render_playground_bottom(frame: &mut Frame, app: &App, area: Rect) {
         ]));
 
     let mut rewrite_lines = Vec::new();
-    if !app.playground_converted {
+    if is_empty_buffer {
+        rewrite_lines.push(Line::from(Span::styled("Awaiting code — enter C or TAC code above, then press [C].", Style::default().fg(COLOR_TEXT_MUTED))));
+    } else if !app.playground_converted {
         rewrite_lines.push(Line::from(Span::styled("Press [C] to convert code and generate transformation trail.", Style::default().fg(COLOR_WARNING))));
     } else if app.playground_transforms.is_empty() {
         rewrite_lines.push(Line::from(Span::styled("No transformations needed for current code.", Style::default().fg(COLOR_TEXT_MUTED))));
@@ -241,7 +310,28 @@ fn render_playground_bottom(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" Dual VM Execution Console ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         ]));
 
-    let vm_lines = if !app.playground_vm_executed {
+    let vm_lines = if is_empty_buffer {
+        vec![
+            Line::from(vec![
+                Span::styled(" Test Inputs:       ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled(format!("{:?}", app.playground_inputs), Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Original Output:   ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled("[Awaiting Code]", Style::default().fg(COLOR_TEXT_MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Optimized Output:  ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled("[Awaiting Code]", Style::default().fg(COLOR_TEXT_MUTED)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Equivalence Check: ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled("[AWAITING CODE — ENTER C OR TAC CODE ABOVE]", Style::default().fg(COLOR_TEXT_MUTED)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Press [i] Edit  [C] Convert  [R] Run VM  [L] Load  [X] Reset", Style::default().fg(COLOR_TEXT_MUTED))),
+        ]
+    } else if !app.playground_vm_executed {
         vec![
             Line::from(vec![
                 Span::styled(" Test Inputs:       ", Style::default().fg(COLOR_TEXT_HEAD)),
@@ -356,3 +446,43 @@ fn render_load_path_modal(frame: &mut Frame, app: &App, area: Rect) {
     let widget = Paragraph::new(content).block(block);
     frame.render_widget(widget, popup_area);
 }
+
+fn render_reset_confirm_modal(frame: &mut Frame, area: Rect) {
+    let popup_width = 58.min(area.width.saturating_sub(4));
+    let popup_height = 8.min(area.height.saturating_sub(2));
+
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(COLOR_WARNING))
+        .style(Style::default().bg(COLOR_PANEL_BG))
+        .title(Line::from(vec![
+            Span::styled(" ⚠ Confirm Buffer Reset ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
+        ]));
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(" Are you sure you want to reset the editor buffer?", Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(" All current code, optimizations, and VM states will be cleared.", Style::default().fg(COLOR_TEXT_MUTED))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" [Y / Enter] ", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD)),
+            Span::styled("Yes, Reset Buffer   ", Style::default().fg(COLOR_TEXT_BODY)),
+            Span::styled(" [N / Esc] ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+            Span::styled("Cancel & Keep Code", Style::default().fg(COLOR_TEXT_BODY)),
+        ]),
+    ];
+
+    let widget = Paragraph::new(content).block(block);
+    frame.render_widget(widget, popup_area);
+}
+

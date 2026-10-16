@@ -1,5 +1,6 @@
 //! Core types and module boundaries for the CodeOpt course project.
 
+pub mod c_frontend;
 pub mod cfg;
 pub mod ir;
 pub mod logging;
