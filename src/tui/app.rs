@@ -142,6 +142,9 @@ pub struct App {
     pub load_file_modal_open: bool,
     pub load_file_path_input: String,
     pub reset_confirm_modal_open: bool,
+    pub playground_fullscreen: bool,
+    pub playground_scroll_row: usize,
+    pub playground_scroll_col: usize,
 }
 
 impl App {
@@ -185,6 +188,9 @@ impl App {
             load_file_modal_open: false,
             load_file_path_input: "samples/demo_math.c".to_string(),
             reset_confirm_modal_open: false,
+            playground_fullscreen: false,
+            playground_scroll_row: 0,
+            playground_scroll_col: 0,
         };
         app
     }
@@ -296,8 +302,16 @@ impl App {
                 }
             }
         } else {
-            self.playground_status_message =
-                Some("OPTIMIZED TAC INSTRUCTIONS".to_string());
+            // Check if user pasted raw GIMPLE / GCC dump with artifacts
+            if source.contains(">;_[") || source.contains("MEM_") || source.contains("MEM[") || source.contains("<bb ") {
+                source = crate::c_frontend::sanitize_gimple_tac(&source);
+                self.playground_buffer = source.lines().map(String::from).collect();
+                self.playground_status_message =
+                    Some("SANITIZED & NORMALIZED GCC DUMP TAC".to_string());
+            } else {
+                self.playground_status_message =
+                    Some("OPTIMIZED TAC INSTRUCTIONS".to_string());
+            }
         }
         let parsed = match parse_program(&source) {
             Ok(p) => p,
@@ -591,6 +605,10 @@ impl App {
                         }
                         return;
                     }
+                    KeyCode::Char('f') | KeyCode::Char('F') => {
+                        self.playground_fullscreen = !self.playground_fullscreen;
+                        return;
+                    }
                     KeyCode::Char('c') | KeyCode::Char('C') => {
                         self.copy_playground_to_clipboard();
                         return;
@@ -638,6 +656,21 @@ impl App {
             match key {
                 KeyCode::Esc => {
                     self.playground_editing = false;
+                }
+                KeyCode::F(11) => {
+                    self.playground_fullscreen = !self.playground_fullscreen;
+                }
+                KeyCode::PageUp => {
+                    self.playground_cursor_row = self.playground_cursor_row.saturating_sub(10);
+                    if self.playground_cursor_row < self.playground_buffer.len() {
+                        self.playground_cursor_col = self.playground_cursor_col.min(self.playground_buffer[self.playground_cursor_row].chars().count());
+                    }
+                }
+                KeyCode::PageDown => {
+                    self.playground_cursor_row = (self.playground_cursor_row + 10).min(self.playground_buffer.len().saturating_sub(1));
+                    if self.playground_cursor_row < self.playground_buffer.len() {
+                        self.playground_cursor_col = self.playground_cursor_col.min(self.playground_buffer[self.playground_cursor_row].chars().count());
+                    }
                 }
                 KeyCode::Left => {
                     if self.playground_cursor_col > 0 {
@@ -881,7 +914,32 @@ impl App {
                 }
                 match key {
                     KeyCode::Esc => {
-                        self.screen = CurrentScreen::Home;
+                        if self.playground_fullscreen {
+                            self.playground_fullscreen = false;
+                            self.playground_status_message = Some("EXITED FULLSCREEN — SPLIT VIEW ACTIVE".to_string());
+                        } else {
+                            self.screen = CurrentScreen::Home;
+                        }
+                    }
+                    KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::F(11) => {
+                        self.playground_fullscreen = !self.playground_fullscreen;
+                        if self.playground_fullscreen {
+                            self.playground_status_message = Some("FULLSCREEN EDITOR ACTIVE — PRESS 'f' OR 'Esc' FOR SPLIT VIEW".to_string());
+                        } else {
+                            self.playground_status_message = Some("SPLIT VIEW ACTIVE — PRESS 'f' FOR FULLSCREEN EDITOR".to_string());
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        self.playground_cursor_row = self.playground_cursor_row.saturating_sub(10);
+                        if self.playground_cursor_row < self.playground_buffer.len() {
+                            self.playground_cursor_col = self.playground_cursor_col.min(self.playground_buffer[self.playground_cursor_row].chars().count());
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        self.playground_cursor_row = (self.playground_cursor_row + 10).min(self.playground_buffer.len().saturating_sub(1));
+                        if self.playground_cursor_row < self.playground_buffer.len() {
+                            self.playground_cursor_col = self.playground_cursor_col.min(self.playground_buffer[self.playground_cursor_row].chars().count());
+                        }
                     }
                     KeyCode::Char('i') => {
                         self.playground_editing = true;
@@ -1459,6 +1517,130 @@ mod tests {
     }
 
     #[test]
+    fn test_playground_gimple_dump_conversion_and_optimization() {
+        let mut app = App::new(BenchmarkCorpus::default());
+        app.screen = CurrentScreen::Playground;
+        app.playground_buffer = vec![
+            "read n".to_string(),
+            "t1 = n".to_string(),
+            "t2 = t1".to_string(),
+            "t3 = t2 * 4".to_string(),
+            "goto bb_3>;_[89_00%]".to_string(),
+            "goto bb_23>;_[11_00%]".to_string(),
+            "t4 = a_56".to_string(),
+            "t5 = t6".to_string(),
+            "read t5".to_string(),
+            "i_87 = i_100 + 1".to_string(),
+            "t7 = n".to_string(),
+            "t8 = t6 + 4".to_string(),
+            "goto bb_4>;_[89_00%]".to_string(),
+            "goto bb_5>;_[11_00%]".to_string(),
+            "goto bb_6>;_[66_29%]".to_string(),
+            "goto bb_23>;_[33_71%]".to_string(),
+            "low_58 = 0".to_string(),
+            "t9 = t7 + -1".to_string(),
+            "high_60 = t9".to_string(),
+            "goto bb_16>;_[100_00%]".to_string(),
+            "t10 = top_46".to_string(),
+            "t11 = t10 * 4".to_string(),
+            "t12 = low_58 + t11".to_string(),
+            "l_69 = t12".to_string(),
+            "top_70 = top_46 + -1".to_string(),
+            "t13 = high_60 + t11".to_string(),
+            "h_71 = t13".to_string(),
+            "t14 = h_71".to_string(),
+            "t15 = t14 * 4".to_string(),
+            "t16 = a_56 + t15".to_string(),
+            "i_73 = l_69 + -1".to_string(),
+            "goto bb_8>;_[89_00%]".to_string(),
+            "goto bb_22>;_[11_00%]".to_string(),
+            "pivot_72 = t16".to_string(),
+            "t17 = l_69".to_string(),
+            "t18 = t17 * 4".to_string(),
+            "t19 = a_56".to_string(),
+            "t20 = t18 + t19".to_string(),
+            "t21 = h_71".to_string(),
+            "t22 = l_69".to_string(),
+            "t23 = t21 - t22".to_string(),
+            "t24 = t23".to_string(),
+            "t25 = t17 + t24".to_string(),
+            "t26 = t25 * 4".to_string(),
+            "t27 = t19 + t26".to_string(),
+            "t28 = t29".to_string(),
+            "if (_21 < = pivot_72)".to_string(),
+            "goto bb_10>;_[50_00%]".to_string(),
+            "goto bb_11>;_[50_00%]".to_string(),
+            "i_81 = i_101 + 1".to_string(),
+            "t31 = i_81".to_string(),
+            "t32 = t31 * 4".to_string(),
+            "t33 = a_56 + t32".to_string(),
+            "temp_82 = t33".to_string(),
+            "t33 = t30".to_string(),
+            "MEM_(int *)_121 = temp_82".to_string(),
+            "t34 = t29 + 4".to_string(),
+            "t35 = t36".to_string(),
+            "goto bb_9>;_[89_00%]".to_string(),
+            "goto bb_12>;_[11_00%]".to_string(),
+            "t37 = i_41".to_string(),
+            "t38 = t37 + 1".to_string(),
+            "t39 = t38 * 4".to_string(),
+            "t40 = a_56 + t39".to_string(),
+            "temp_74 = t40".to_string(),
+            "t41 = t16".to_string(),
+            "t40 = t41".to_string(),
+            "t16 = temp_74".to_string(),
+            "goto bb_13>;_[56_18%]".to_string(),
+            "goto bb_14>;_[43_82%]".to_string(),
+            "t13 = i_41".to_string(),
+            "t42 = i_93 + 2".to_string(),
+            "goto bb_15>;_[5_50%]".to_string(),
+            "goto bb_18>;_[94_50%]".to_string(),
+            "top_78 = top_45 + 1".to_string(),
+            "t43 = top_78".to_string(),
+            "t44 = t43 * 4".to_string(),
+            "t45 = low_58 + t44".to_string(),
+            "t45 = t42".to_string(),
+            "t46 = high_60 + t44".to_string(),
+            "t46 = h_71".to_string(),
+            "goto bb_17>;_[100_00%]".to_string(),
+            "if (top_46 > = 0)".to_string(),
+            "goto bb_7>;_[94_50%]".to_string(),
+            "goto bb_19>;_[5_50%]".to_string(),
+            "t47 = n".to_string(),
+            "goto bb_20>;_[89_00%]".to_string(),
+            "goto bb_21>;_[11_00%]".to_string(),
+            "print t48".to_string(),
+            "t49 = n".to_string(),
+            "t50 = t51 + 1".to_string(),
+            "i_114 = t50".to_string(),
+            "goto bb_20>;_[89_00%]".to_string(),
+            "goto bb_21>;_[11_00%]".to_string(),
+            "t52 = l_69".to_string(),
+            "t53 = t52 * 4".to_string(),
+            "t54 = a_56 + t53".to_string(),
+            "temp_47 = t54".to_string(),
+            "t55 = t16".to_string(),
+            "t54 = t55".to_string(),
+            "t16 = temp_47".to_string(),
+            "goto bb_14>;_[100_00%]".to_string(),
+        ];
+
+        app.convert_playground();
+
+        // Must succeed without syntax error
+        assert!(app.playground_converted);
+        assert!(app.playground_parse_error.is_none());
+        assert_eq!(
+            app.playground_status_message.as_deref(),
+            Some("SANITIZED & NORMALIZED GCC DUMP TAC")
+        );
+
+        // Optimizations must have fired
+        assert!(!app.playground_transforms.is_empty());
+        assert!(app.playground_opt_lines.iter().any(|l| l.contains("<< 2")));
+    }
+
+    #[test]
     fn test_analytics_deck_rendering_and_metrics() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -1510,5 +1692,110 @@ mod tests {
             assert!(content.contains("Per-Optimizer Effectiveness"));
             assert!(content.contains("PASS"));
         }
+    }
+
+    #[test]
+    fn test_playground_fullscreen_and_scrolling() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::tui::views::playground::render_playground;
+
+        let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
+        let mut app = App::new(corpus);
+
+        // Navigate to Playground
+        app.screen = CurrentScreen::Playground;
+        assert!(!app.playground_fullscreen);
+
+        // 1. Test toggling fullscreen with 'f'
+        app.handle_key(KeyCode::Char('f'));
+        assert!(app.playground_fullscreen);
+        assert!(app.playground_status_message.as_ref().unwrap().contains("FULLSCREEN EDITOR ACTIVE"));
+
+        // 2. Test toggling fullscreen back to split view with 'f'
+        app.handle_key(KeyCode::Char('f'));
+        assert!(!app.playground_fullscreen);
+        assert!(app.playground_status_message.as_ref().unwrap().contains("SPLIT VIEW ACTIVE"));
+
+        // 3. Test toggling fullscreen with 'f', then exiting fullscreen via 'Esc'
+        app.handle_key(KeyCode::Char('f'));
+        assert!(app.playground_fullscreen);
+        app.handle_key(KeyCode::Esc);
+        assert!(!app.playground_fullscreen);
+        assert_eq!(app.screen, CurrentScreen::Playground);
+
+        // 4. Pressing Esc when already in split view exits to Home
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.screen, CurrentScreen::Home);
+
+        // Return to Playground
+        app.screen = CurrentScreen::Playground;
+
+        // 5. Populate a large 60-line program to test vertical scrolling
+        app.playground_buffer = (1..=60)
+            .map(|i| format!("int v{} = {} * 2;", i, i))
+            .collect();
+        app.playground_cursor_row = 0;
+        app.playground_cursor_col = 0;
+
+        // Navigate down past viewport using PageDown
+        app.handle_key(KeyCode::PageDown);
+        assert_eq!(app.playground_cursor_row, 10);
+        app.handle_key(KeyCode::PageDown);
+        assert_eq!(app.playground_cursor_row, 20);
+
+        // Navigate down using Down key
+        for _ in 0..5 {
+            app.handle_key(KeyCode::Down);
+        }
+        assert_eq!(app.playground_cursor_row, 25);
+
+        // Navigate up using PageUp
+        app.handle_key(KeyCode::PageUp);
+        assert_eq!(app.playground_cursor_row, 15);
+
+        // 6. Test rendering split view with scrolled buffer (terminal height 25)
+        let backend = TestBackend::new(120, 25);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| {
+            render_playground(f, &app, f.area());
+        }).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("Input Buffer (C or TAC)"));
+        assert!(content.contains("60 lines"));
+
+        // 7. Toggle Fullscreen mode with large buffer and render
+        app.handle_key(KeyCode::Char('f'));
+        assert!(app.playground_fullscreen);
+
+        let backend = TestBackend::new(120, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| {
+            render_playground(f, &app, f.area());
+        }).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("FULL-SCREEN EDITOR"));
+        assert!(content.contains("60 lines"));
+        assert!(content.contains("FULLSCREEN ACTIVE"));
+
+        // 8. Test edit mode and cursor blinker toggle
+        app.handle_key(KeyCode::Char('i'));
+        assert!(app.playground_editing);
+
+        // Verify tick increments and alternates blinker
+        let initial_tick = app.tick_count;
+        let initial_blinker = (initial_tick / 3) % 2 == 0;
+        for _ in 0..3 {
+            app.tick();
+        }
+        assert_eq!((app.tick_count / 3) % 2 == 0, !initial_blinker);
+
+        // 9. Convert & run VM inside fullscreen mode
+        app.convert_playground();
+        assert!(app.playground_converted);
     }
 }

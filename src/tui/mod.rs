@@ -110,22 +110,20 @@ fn event_loop(
     loop {
         terminal.draw(|frame| app.render(frame))?;
 
-        if !event::poll(Duration::from_millis(150))? {
-            app.tick();
-            continue;
-        }
-
-        match event::read()? {
-            Event::Key(key) => {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key_event(key);
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        app.handle_key_event(key);
+                    }
                 }
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                }
+                _ => {}
             }
-            Event::Paste(text) => {
-                app.handle_paste(&text);
-            }
-            _ => {}
         }
+        app.tick();
 
         if app.should_quit {
             return Ok(());

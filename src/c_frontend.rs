@@ -4,7 +4,7 @@
 //! - Tier 1 (Active Default): Native pure-Rust in-memory C-subset lowerer (zero external dependencies).
 //! - Tier 2 (Strictly Dormant Backup): GCC GIMPLE bridge invoked only via explicit CLI `c-backup`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -956,6 +956,80 @@ pub fn lower_c_source_via_gcc_backup(c_source: &str) -> Result<String, String> {
     res
 }
 
+fn clean_gimple_label(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let name = if let (Some(open), Some(close)) = (trimmed.find('<'), trimmed.find('>')) {
+        if close > open {
+            &trimmed[open + 1..close]
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed.split([';', ':', '[', ' ', '\t']).next().unwrap_or(trimmed)
+    };
+
+    let mut cleaned: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+
+    // Strip leading or trailing underscores
+    cleaned = cleaned.trim_matches('_').to_string();
+
+    if cleaned.is_empty() {
+        cleaned = "bb_target".to_string();
+    }
+    // If it starts with a digit, prefix with "bb_"
+    if cleaned.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+        cleaned = format!("bb_{cleaned}");
+    }
+    cleaned
+}
+
+fn extract_goto_target(s: &str) -> Option<String> {
+    if let Some(pos) = s.find("goto") {
+        let after = s[pos + 4..].trim();
+        let lbl = clean_gimple_label(after);
+        if !lbl.is_empty() {
+            return Some(lbl);
+        }
+    }
+    None
+}
+
+fn lower_gimple_condition(
+    cond: &str,
+    temp_map: &mut HashMap<String, String>,
+    temp_count: &mut usize,
+    pointer_map: &HashMap<String, String>,
+    tac_lines: &mut Vec<String>,
+) -> String {
+    let normalized = cond.replace("< =", "<=").replace("> =", ">=").replace("= =", "==").replace("! =", "!=");
+    let trimmed = normalized.trim();
+    for op in &["<=", ">=", "==", "!=", "<", ">"] {
+        if let Some(pos) = trimmed.find(op) {
+            let left = trimmed[..pos].trim();
+            let right = trimmed[pos + op.len()..].trim();
+            let cl_left = clean_gimple_token(left, temp_map, temp_count, pointer_map);
+            let cl_right = clean_gimple_token(right, temp_map, temp_count, pointer_map);
+
+            if *op == "==" && cl_right == "0" {
+                return cl_left;
+            }
+            *temp_count += 1;
+            let cond_temp = format!("t{}", *temp_count);
+            tac_lines.push(format!("{cond_temp} = {cl_left} - {cl_right}"));
+            return cond_temp;
+        }
+    }
+
+    if let Some(inner) = trimmed.strip_prefix('!') {
+        clean_gimple_token(inner, temp_map, temp_count, pointer_map)
+    } else {
+        clean_gimple_token(trimmed, temp_map, temp_count, pointer_map)
+    }
+}
+
 fn clean_gimple_token(
     raw: &str,
     temp_map: &mut HashMap<String, String>,
@@ -963,7 +1037,8 @@ fn clean_gimple_token(
     pointer_map: &HashMap<String, String>,
 ) -> String {
     let mut token = raw.trim();
-    // Strip type casts like (int), (long unsigned int), (sizetype)
+
+    // Strip type casts like (int), (long unsigned int), (sizetype), (int *)
     while token.starts_with('(') {
         if let Some(close_paren) = token.find(')') {
             token = token[close_paren + 1..].trim();
@@ -971,7 +1046,8 @@ fn clean_gimple_token(
             break;
         }
     }
-    // Pointer dereference: *a or *_1
+
+    // Pointer dereference: *a or *_1 or *a_3(D)
     if let Some(inner) = token.strip_prefix('*') {
         let clean_inner = clean_gimple_token(inner, temp_map, temp_count, pointer_map);
         if let Some(target) = pointer_map.get(&clean_inner) {
@@ -979,20 +1055,46 @@ fn clean_gimple_token(
         }
         return clean_inner;
     }
+
     // Address-of: &x
     if let Some(inner) = token.strip_prefix('&') {
         return clean_gimple_token(inner, temp_map, temp_count, pointer_map);
     }
+
+    // MEM expressions: MEM[(int *)_121] or MEM <int[100]> [(int *)&a][_7]
+    if token.starts_with("MEM") {
+        if let Some(last_open) = token.rfind('[') {
+            if let Some(last_close) = token.rfind(']') {
+                if last_close > last_open {
+                    let inner = &token[last_open + 1..last_close];
+                    let cleaned_inner = clean_gimple_token(inner, temp_map, temp_count, pointer_map);
+                    if !cleaned_inner.is_empty() {
+                        return format!("mem_{cleaned_inner}");
+                    }
+                }
+            }
+        }
+        *temp_count += 1;
+        return format!("t{}", *temp_count);
+    }
+
+    // Strip SSA default definition annotations: e.g. a_3(D) -> a_3
+    if token.ends_with("(D)") {
+        token = token[..token.len() - 3].trim();
+    }
+
     // Array indexing: arr[0] -> arr_0
     if token.contains('[') && token.contains(']') {
         let cleaned = token.replace('[', "_").replace(']', "");
         return cleaned;
     }
-    // Check if it's already a clean integer constant
+
+    // Check if it's already a clean integer constant (including negative)
     if token.parse::<i32>().is_ok() {
         return token.to_string();
     }
-    // Compiler temporaries: _1, x.1_2, D.3440, etc.
+
+    // Compiler temporaries: _1, x.1_2, D.3440, ivtmp.27_54, etc.
     if token.starts_with('_') || token.contains('.') || token.contains('#') {
         if let Some(mapped) = temp_map.get(token) {
             return mapped.clone();
@@ -1002,7 +1104,19 @@ fn clean_gimple_token(
         temp_map.insert(token.to_string(), fresh.clone());
         return fresh;
     }
-    token.to_string()
+
+    // Final sanity check: retain only valid identifier characters
+    let sanitized: String = token
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+
+    if sanitized.is_empty() {
+        *temp_count += 1;
+        format!("t{}", *temp_count)
+    } else {
+        sanitized
+    }
 }
 
 fn parse_gimple_to_tac(gimple_source: &str) -> Result<String, String> {
@@ -1010,11 +1124,16 @@ fn parse_gimple_to_tac(gimple_source: &str) -> Result<String, String> {
     let mut temp_map: HashMap<String, String> = HashMap::new();
     let mut pointer_map: HashMap<String, String> = HashMap::new();
     let mut temp_count = 0;
+    let mut defined_labels: HashSet<String> = HashSet::new();
+    let mut referenced_labels: HashSet<String> = HashSet::new();
 
     let mut in_main = false;
+    let lines: Vec<&str> = gimple_source.lines().map(str::trim).collect();
+    let mut i = 0;
 
-    for raw_line in gimple_source.lines() {
-        let line = raw_line.trim();
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
 
         if line.contains("main ()") || line.contains("main (") {
             in_main = true;
@@ -1037,15 +1156,72 @@ fn parse_gimple_to_tac(gimple_source: &str) -> Result<String, String> {
             || line == "}"
             || line == "try"
             || line == "finally"
+            || line == "else"
             || line.starts_with("int ")
             || line.starts_with("void ")
             || line.starts_with("return ")
-            || line.starts_with("<bb ")
             || line.starts_with("# ")
-            || line.starts_with("MEM <")
             || line.contains("CLOBBER")
             || line.is_empty()
         {
+            continue;
+        }
+
+        // Basic block label: <bb 2> [local count: ...]: or <bb 3>: or <D.3486>: or label:
+        if (line.starts_with("<bb ") || line.starts_with("<D.") || line.starts_with("bb_") || line.ends_with(':')) && line.contains(':') {
+            let lbl = clean_gimple_label(line);
+            defined_labels.insert(lbl.clone());
+            tac_lines.push(format!("{lbl}:"));
+            continue;
+        }
+
+        // Conditional branch: if (condition)
+        if line.starts_with("if (") || line.starts_with("if(") {
+            let open = line.find('(').unwrap_or(0);
+            let close = line.rfind(')').unwrap_or(line.len());
+            let cond_expr = &line[open + 1..close];
+
+            let mut then_target = None;
+            let mut else_target = None;
+
+            if line.contains("goto") {
+                let after = &line[close + 1..];
+                if let Some(else_pos) = after.find("else") {
+                    then_target = extract_goto_target(&after[..else_pos]);
+                    else_target = extract_goto_target(&after[else_pos + 4..]);
+                } else {
+                    then_target = extract_goto_target(after);
+                }
+            }
+
+            while (then_target.is_none() || else_target.is_none()) && i < lines.len() {
+                let next_line = lines[i];
+                if next_line.starts_with("goto ") || next_line.starts_with("goto<") {
+                    if then_target.is_none() {
+                        then_target = extract_goto_target(next_line);
+                        i += 1;
+                    } else if else_target.is_none() {
+                        else_target = extract_goto_target(next_line);
+                        i += 1;
+                        break;
+                    }
+                } else if next_line == "else" {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+
+            let cond_val = lower_gimple_condition(cond_expr, &mut temp_map, &mut temp_count, &pointer_map, &mut tac_lines);
+
+            if let Some(else_lbl) = else_target {
+                referenced_labels.insert(else_lbl.clone());
+                tac_lines.push(format!("if_false {cond_val} goto {else_lbl}"));
+            }
+            if let Some(then_lbl) = then_target {
+                referenced_labels.insert(then_lbl.clone());
+                tac_lines.push(format!("goto {then_lbl}"));
+            }
             continue;
         }
 
@@ -1125,26 +1301,10 @@ fn parse_gimple_to_tac(gimple_source: &str) -> Result<String, String> {
             continue;
         }
 
-        // goto <D.xxxx> or goto label
-        if let Some(target) = line.strip_prefix("goto ") {
-            let label = target
-                .trim()
-                .trim_end_matches(';')
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .replace([' ', '.'], "_");
-            tac_lines.push(format!("goto {label}"));
-            continue;
-        }
-
-        // Label: <D.xxxx>: or <bb 2>: or label:
-        if line.ends_with(':') {
-            let label = line
-                .trim_end_matches(':')
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .replace([' ', '.'], "_");
-            tac_lines.push(format!("{label}:"));
+        // Unconditional goto: goto <D.xxxx> or goto <bb 3>; [89.00%]
+        if let Some(target) = extract_goto_target(line) {
+            referenced_labels.insert(target.clone());
+            tac_lines.push(format!("goto {target}"));
             continue;
         }
     }
@@ -1153,7 +1313,160 @@ fn parse_gimple_to_tac(gimple_source: &str) -> Result<String, String> {
         return Err("No scalar TAC statements could be extracted from GCC intermediate dump".to_string());
     }
 
+    // Ensure any referenced jump target label is defined at the end of the program
+    for lbl in &referenced_labels {
+        if !defined_labels.contains(lbl) {
+            tac_lines.push(format!("{lbl}:"));
+        }
+    }
+
     Ok(tac_lines.join("\n"))
+}
+
+/// Sanitizes a TAC buffer that may contain raw GIMPLE / GCC dump artifacts
+/// (such as branch probabilities `bb_3>;_[89_00%]`, `MEM_(...)`, or raw `if (...)`).
+pub fn sanitize_gimple_tac(source: &str) -> String {
+    let mut tac_lines = Vec::new();
+    let mut defined_labels: HashSet<String> = HashSet::new();
+    let mut referenced_labels: HashSet<String> = HashSet::new();
+    let mut temp_counter = 100;
+
+    let lines: Vec<&str> = source.lines().map(str::trim).collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+
+        if line.is_empty() {
+            continue;
+        }
+
+        // Check if line is a label definition
+        if line.ends_with(':') {
+            let label = clean_gimple_label(line.trim_end_matches(':'));
+            defined_labels.insert(label.clone());
+            tac_lines.push(format!("{label}:"));
+            continue;
+        }
+
+        // Check for raw 'if (cond)' followed by gotos
+        if line.starts_with("if (") || line.starts_with("if(") {
+            let open = line.find('(').unwrap_or(0);
+            let close = line.rfind(')').unwrap_or(line.len());
+            let cond_expr = &line[open + 1..close];
+
+            let mut then_target = None;
+            let mut else_target = None;
+
+            if line.contains("goto") {
+                let after = &line[close + 1..];
+                if let Some(else_pos) = after.find("else") {
+                    then_target = extract_goto_target(&after[..else_pos]);
+                    else_target = extract_goto_target(&after[else_pos + 4..]);
+                } else {
+                    then_target = extract_goto_target(after);
+                }
+            }
+
+            while (then_target.is_none() || else_target.is_none()) && i < lines.len() {
+                let next_line = lines[i];
+                if next_line.starts_with("goto") {
+                    if then_target.is_none() {
+                        then_target = extract_goto_target(next_line);
+                        i += 1;
+                    } else if else_target.is_none() {
+                        else_target = extract_goto_target(next_line);
+                        i += 1;
+                        break;
+                    }
+                } else if next_line == "else" {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+
+            temp_counter += 1;
+            let cond_temp = format!("t_cond_{}", temp_counter);
+            let normalized_cond = cond_expr
+                .replace("< =", "<=")
+                .replace("> =", ">=")
+                .replace("= =", "==")
+                .replace("! =", "!=");
+            let (left, right) = if let Some((l, r)) = normalized_cond.split_once("<=")
+                .or_else(|| normalized_cond.split_once(">="))
+                .or_else(|| normalized_cond.split_once("=="))
+                .or_else(|| normalized_cond.split_once("!="))
+                .or_else(|| normalized_cond.split_once('<'))
+                .or_else(|| normalized_cond.split_once('>'))
+            {
+                (l.trim(), r.trim())
+            } else {
+                (normalized_cond.trim(), "0")
+            };
+            tac_lines.push(format!("{cond_temp} = {left} - {right}"));
+
+            if let Some(else_lbl) = else_target {
+                referenced_labels.insert(else_lbl.clone());
+                tac_lines.push(format!("if_false {cond_temp} goto {else_lbl}"));
+            }
+            if let Some(then_lbl) = then_target {
+                referenced_labels.insert(then_lbl.clone());
+                tac_lines.push(format!("goto {then_lbl}"));
+            }
+            continue;
+        }
+
+        // Clean gotos: goto bb_3>;_[89_00%] -> goto bb_3
+        if line.starts_with("goto") {
+            if let Some(target) = extract_goto_target(line) {
+                referenced_labels.insert(target.clone());
+                tac_lines.push(format!("goto {target}"));
+            }
+            continue;
+        }
+
+        // Clean if_false destination: if_false x goto bb_3>;_[89_00%]
+        if line.starts_with("if_false") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                let cond = parts[1];
+                let target = clean_gimple_label(parts[3]);
+                referenced_labels.insert(target.clone());
+                tac_lines.push(format!("if_false {cond} goto {target}"));
+                continue;
+            }
+        }
+
+        // Clean MEM assignments: MEM_(int *)_121 = temp_82 -> mem_121 = temp_82
+        if line.contains("MEM") {
+            let mut cleaned_line = line
+                .replace("(int *)", "")
+                .replace("(void *)", "")
+                .replace("(int)", "")
+                .replace(['(', ')', '[', ']', '*'], "")
+                .replace("MEM_", "mem_")
+                .replace("MEM", "mem_");
+            while cleaned_line.contains("__") {
+                cleaned_line = cleaned_line.replace("__", "_");
+            }
+            let tokens: Vec<&str> = cleaned_line.split_whitespace().collect();
+            tac_lines.push(tokens.join(" "));
+            continue;
+        }
+
+        tac_lines.push(line.to_string());
+    }
+
+    // Emit any missing referenced labels at the end so CFG is complete
+    for lbl in &referenced_labels {
+        if !defined_labels.contains(lbl) {
+            tac_lines.push(format!("{lbl}:"));
+        }
+    }
+
+    tac_lines.join("\n")
 }
 
 // ============================================================================
@@ -1292,5 +1605,142 @@ mod tests {
 
         let res_five = execute(&prog, &[5]).expect("VM execution for 5");
         assert_eq!(res_five.output, vec![10]);
+    }
+
+    #[test]
+    fn test_gimple_dump_sanitization_and_optimization() {
+        let raw_gimple_tac = r#"
+read n
+t1 = n
+t2 = t1
+t3 = t2 * 4
+goto bb_3>;_[89_00%]
+goto bb_23>;_[11_00%]
+t4 = a_56
+t5 = t6
+read t5
+i_87 = i_100 + 1
+t7 = n
+t8 = t6 + 4
+goto bb_4>;_[89_00%]
+goto bb_5>;_[11_00%]
+goto bb_6>;_[66_29%]
+goto bb_23>;_[33_71%]
+low_58 = 0
+t9 = t7 + -1
+high_60 = t9
+goto bb_16>;_[100_00%]
+t10 = top_46
+t11 = t10 * 4
+t12 = low_58 + t11
+l_69 = t12
+top_70 = top_46 + -1
+t13 = high_60 + t11
+h_71 = t13
+t14 = h_71
+t15 = t14 * 4
+t16 = a_56 + t15
+i_73 = l_69 + -1
+goto bb_8>;_[89_00%]
+goto bb_22>;_[11_00%]
+pivot_72 = t16
+t17 = l_69
+t18 = t17 * 4
+t19 = a_56
+t20 = t18 + t19
+t21 = h_71
+t22 = l_69
+t23 = t21 - t22
+t24 = t23
+t25 = t17 + t24
+t26 = t25 * 4
+t27 = t19 + t26
+t28 = t29
+if (_21 < = pivot_72)
+goto bb_10>;_[50_00%]
+goto bb_11>;_[50_00%]
+i_81 = i_101 + 1
+t31 = i_81
+t32 = t31 * 4
+t33 = a_56 + t32
+temp_82 = t33
+t33 = t30
+MEM_(int *)_121 = temp_82
+t34 = t29 + 4
+t35 = t36
+goto bb_9>;_[89_00%]
+goto bb_12>;_[11_00%]
+t37 = i_41
+t38 = t37 + 1
+t39 = t38 * 4
+t40 = a_56 + t39
+temp_74 = t40
+t41 = t16
+t40 = t41
+t16 = temp_74
+goto bb_13>;_[56_18%]
+goto bb_14>;_[43_82%]
+t13 = i_41
+t42 = i_93 + 2
+goto bb_15>;_[5_50%]
+goto bb_18>;_[94_50%]
+top_78 = top_45 + 1
+t43 = top_78
+t44 = t43 * 4
+t45 = low_58 + t44
+t45 = t42
+t46 = high_60 + t44
+t46 = h_71
+goto bb_17>;_[100_00%]
+if (top_46 > = 0)
+goto bb_7>;_[94_50%]
+goto bb_19>;_[5_50%]
+t47 = n
+goto bb_20>;_[89_00%]
+goto bb_21>;_[11_00%]
+print t48
+t49 = n
+t50 = t51 + 1
+i_114 = t50
+goto bb_20>;_[89_00%]
+goto bb_21>;_[11_00%]
+t52 = l_69
+t53 = t52 * 4
+t54 = a_56 + t53
+temp_47 = t54
+t55 = t16
+t54 = t55
+t16 = temp_47
+goto bb_14>;_[100_00%]
+        "#;
+
+        let clean_tac = sanitize_gimple_tac(raw_gimple_tac);
+
+        // Verify artifact removal
+        assert!(!clean_tac.contains(">;_["));
+        assert!(!clean_tac.contains("%"));
+        assert!(!clean_tac.contains("MEM_"));
+        assert!(!clean_tac.contains("(int *)"));
+        assert!(clean_tac.contains("goto bb_3"));
+        assert!(clean_tac.contains("goto bb_23"));
+        assert!(clean_tac.contains("mem_121 = temp_82"));
+
+        // Verify it parses without error
+        let mut prog = parse_program(&clean_tac).expect("Cleaned TAC must parse successfully");
+
+        // Verify CFG builds with all labels resolved
+        let cfg = build(&mut prog).expect("CFG must build with all jump targets resolved");
+
+        // Verify optimization pipeline executes and fires passes
+        let report = optimize_with_worklist(&mut prog, &cfg);
+        assert!(!report.transformations.is_empty());
+
+        let sr_fired = report.transformations.iter().any(|t| t.pass == crate::passes::OptimizationKind::StrengthReduction);
+        let cp_fired = report.transformations.iter().any(|t| t.pass == crate::passes::OptimizationKind::ConstantPropagation);
+        let dce_fired = report.transformations.iter().any(|t| t.pass == crate::passes::OptimizationKind::DeadCodeElimination);
+
+        assert!(sr_fired, "Strength Reduction must fire on * 4 rewrites");
+        assert!(cp_fired, "Constant Propagation must fire on alias chains");
+        assert!(dce_fired, "Dead Code Elimination must prune dead temporaries");
     }
 }
