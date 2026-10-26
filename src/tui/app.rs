@@ -1857,6 +1857,11 @@ mod tests {
             assert!(content.contains("5. Scatter"));
             assert!(content.contains("6. Heatmap"));
 
+            // Verify Panel 1 clean formatting without collision
+            assert!(content.contains("CF"));
+            assert!(content.contains("COMB"));
+            assert!(content.contains("→"));
+
             // Verify Section 5 Aggregate Metrics Summary Table & Per-Optimizer Panel
             assert!(content.contains("Section 5: Aggregate Benchmark Metrics"));
             assert!(content.contains("Instruction Count"));

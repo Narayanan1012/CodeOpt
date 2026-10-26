@@ -6,7 +6,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Bar, BarChart, BarGroup, Block, BorderType, Borders, Cell, Paragraph, Row,
+        Block, BorderType, Borders, Cell, Paragraph, Row,
         Sparkline, Table,
     },
 };
@@ -79,7 +79,38 @@ fn render_top_row_charts(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" 1. Instrs: Before vs After ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
         ]));
 
-    let mut bars = Vec::new();
+    let inner_width = cols[0].width.saturating_sub(2) as usize;
+    let inner_height = cols[0].height.saturating_sub(2) as usize;
+    let show_pct = inner_width >= 24;
+    let text_len = if show_pct { 24 } else { 16 };
+    let bar_len = if inner_width > text_len + 3 {
+        (inner_width - text_len - 2).min(20)
+    } else {
+        0
+    };
+
+    let mut instrs_lines = Vec::new();
+    if inner_height >= 10 {
+        instrs_lines.push(Line::from(vec![
+            Span::styled("■ ", Style::default().fg(COLOR_INDIGO)),
+            Span::styled("Orig  ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
+            Span::styled("■ ", Style::default().fg(COLOR_SUCCESS)),
+            Span::styled("Opt  ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+            Span::styled("░ ", Style::default().fg(COLOR_CYAN)),
+            Span::styled("Saved", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+        ]));
+        instrs_lines.push(Line::from(""));
+    } else if inner_height >= 9 {
+        instrs_lines.push(Line::from(vec![
+            Span::styled("■ ", Style::default().fg(COLOR_INDIGO)),
+            Span::styled("Orig  ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
+            Span::styled("■ ", Style::default().fg(COLOR_SUCCESS)),
+            Span::styled("Opt  ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+            Span::styled("░ ", Style::default().fg(COLOR_CYAN)),
+            Span::styled("Saved", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+
     for cat in &ALL_CATEGORIES[1..] {
         let items = app.corpus.filter_by_category(*cat);
         if items.is_empty() {
@@ -87,18 +118,53 @@ fn render_top_row_charts(frame: &mut Frame, app: &App, area: Rect) {
         }
         let orig: u64 = items.iter().map(|i| i.original_stats.instruction_count as u64).sum();
         let opt: u64 = items.iter().map(|i| i.optimized_stats.instruction_count as u64).sum();
-        let label_orig = format!("{}-B", cat.short_code());
-        let label_opt = format!("{}-A", cat.short_code());
-        bars.push(Bar::default().value(orig).label(Line::from(label_orig)).style(Style::default().fg(COLOR_INDIGO)));
-        bars.push(Bar::default().value(opt).label(Line::from(label_opt)).style(Style::default().fg(COLOR_SUCCESS)));
+        let pct = if orig > 0 {
+            ((orig as f64 - opt as f64) / orig as f64 * 100.0).round() as i64
+        } else {
+            0
+        };
+
+        let mut spans = vec![
+            Span::styled(format!("{:<4} : ", cat.short_code()), Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{:>3}", orig), Style::default().fg(COLOR_INDIGO)),
+            Span::styled(" → ", Style::default().fg(COLOR_TEXT_MUTED)),
+            Span::styled(format!("{:>3}", opt), Style::default().fg(COLOR_SUCCESS)),
+        ];
+
+        if show_pct {
+            let pct_str = if pct > 0 {
+                format!(" (-{:>2}%)", pct)
+            } else if pct < 0 {
+                format!(" (+{:>2}%)", -pct)
+            } else {
+                " (  0%)".to_string()
+            };
+            spans.push(Span::styled(pct_str, Style::default().fg(if pct > 0 { COLOR_CYAN } else { COLOR_TEXT_MUTED })));
+        }
+
+        if bar_len > 0 && orig > 0 {
+            let opt_len = if opt == 0 {
+                0
+            } else {
+                ((opt as f64 / orig as f64) * bar_len as f64).round() as usize
+            }.clamp(if opt > 0 { 1 } else { 0 }, bar_len);
+            let saved_len = bar_len.saturating_sub(opt_len);
+
+            spans.push(Span::styled(" [", Style::default().fg(COLOR_TEXT_MUTED)));
+            if opt_len > 0 {
+                spans.push(Span::styled("█".repeat(opt_len), Style::default().fg(COLOR_SUCCESS)));
+            }
+            if saved_len > 0 {
+                spans.push(Span::styled("░".repeat(saved_len), Style::default().fg(COLOR_CYAN)));
+            }
+            spans.push(Span::styled("]", Style::default().fg(COLOR_TEXT_MUTED)));
+        }
+
+        instrs_lines.push(Line::from(spans));
     }
 
-    let barchart = BarChart::default()
-        .block(bar_block)
-        .bar_width(2)
-        .bar_gap(0)
-        .data(BarGroup::default().bars(&bars));
-    frame.render_widget(barchart, cols[0]);
+    let instrs_widget = Paragraph::new(instrs_lines).block(bar_block);
+    frame.render_widget(instrs_widget, cols[0]);
 
     // 2. Stacked Bar: Which Optimizers Fired for Each Program / Category
     let stacked_block = Block::default()
