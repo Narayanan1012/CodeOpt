@@ -139,6 +139,9 @@ fn parse_value(token: &str, line: usize) -> Result<Operand, ParseError> {
     if let Ok(value) = token.parse::<i32>() {
         return Ok(Operand::Const(value));
     }
+    if let Ok(value) = token.parse::<u32>() {
+        return Ok(Operand::Const(value as i32));
+    }
 
     parse_variable(token, line)
 }

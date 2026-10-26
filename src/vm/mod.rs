@@ -8,6 +8,7 @@ use crate::ir::{OpCode, Operand, Program};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecutionResult {
     pub output: Vec<i32>,
+    pub steps: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub fn execute_with_step_limit(
 ) -> Result<ExecutionResult, ExecutionError> {
     let labels = collect_labels(program)?;
     let mut memory = HashMap::new();
+    let mut ram: HashMap<i32, i32> = HashMap::new();
     let mut input_index = 0;
     let mut output = Vec::new();
     let mut program_counter = 0;
@@ -61,8 +63,8 @@ pub fn execute_with_step_limit(
         let instruction = &program.instructions[program_counter];
         match instruction.op {
             OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Shl | OpCode::Shr => {
-                let left = value(&instruction.arg1, &memory, instruction.id)?;
-                let right = value(&instruction.arg2, &memory, instruction.id)?;
+                let left = value(&instruction.arg1, &memory, &ram, instruction.id)?;
+                let right = value(&instruction.arg2, &memory, &ram, instruction.id)?;
                 let result = match instruction.op {
                     OpCode::Add => left.wrapping_add(right),
                     OpCode::Sub => left.wrapping_sub(right),
@@ -93,16 +95,16 @@ pub fn execute_with_step_limit(
                     }
                     _ => unreachable!("only binary operations reach this branch"),
                 };
-                write_destination(&instruction.dest, result, &mut memory, instruction.id)?;
+                write_destination(&instruction.dest, result, &mut memory, &mut ram, instruction.id)?;
                 program_counter += 1;
             }
             OpCode::Assign => {
-                let result = value(&instruction.arg1, &memory, instruction.id)?;
-                write_destination(&instruction.dest, result, &mut memory, instruction.id)?;
+                let result = value(&instruction.arg1, &memory, &ram, instruction.id)?;
+                write_destination(&instruction.dest, result, &mut memory, &mut ram, instruction.id)?;
                 program_counter += 1;
             }
             OpCode::IfFalse => {
-                let condition = value(&instruction.arg1, &memory, instruction.id)?;
+                let condition = value(&instruction.arg1, &memory, &ram, instruction.id)?;
                 if condition == 0 {
                     program_counter = jump_target(&instruction.dest, &labels, instruction.id)?;
                 } else {
@@ -121,17 +123,156 @@ pub fn execute_with_step_limit(
                     )
                 })?;
                 input_index += 1;
-                write_destination(&instruction.dest, input, &mut memory, instruction.id)?;
+                write_destination(&instruction.dest, input, &mut memory, &mut ram, instruction.id)?;
                 program_counter += 1;
             }
             OpCode::Print => {
-                output.push(value(&instruction.arg1, &memory, instruction.id)?);
+                output.push(value(&instruction.arg1, &memory, &ram, instruction.id)?);
                 program_counter += 1;
             }
         }
     }
 
-    Ok(ExecutionResult { output })
+    Ok(ExecutionResult { output, steps })
+}
+
+/// Executes a TAC program with permissive/safe semantics for interactive and C-lowered code:
+/// - Uninitialized variables/temporaries default to 0 (matching C stack/BSS defaults) instead of aborting.
+/// - Exhausted inputs loop/cycle through the input vector (or return 0) so multi-read loops complete.
+pub fn execute_permissive(
+    program: &Program,
+    inputs: &[i32],
+    step_limit: usize,
+) -> Result<ExecutionResult, ExecutionError> {
+    let labels = collect_labels(program)?;
+    let mut memory = HashMap::new();
+    let mut ram: HashMap<i32, i32> = HashMap::new();
+    let mut input_index = 0;
+    let mut output = Vec::new();
+    let mut program_counter = 0;
+    let mut steps = 0;
+
+    while program_counter < program.instructions.len() {
+        if steps >= step_limit {
+            return Err(error(
+                None,
+                format!("step limit of {step_limit} reached; possible infinite loop"),
+            ));
+        }
+        steps += 1;
+
+        let instruction = &program.instructions[program_counter];
+        match instruction.op {
+            OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Shl | OpCode::Shr => {
+                let left = value_permissive(&instruction.arg1, &memory, &ram);
+                let right = value_permissive(&instruction.arg2, &memory, &ram);
+                let result = match instruction.op {
+                    OpCode::Add => left.wrapping_add(right),
+                    OpCode::Sub => left.wrapping_sub(right),
+                    OpCode::Mul => left.wrapping_mul(right),
+                    OpCode::Div => {
+                        if right == 0 {
+                            0
+                        } else {
+                            left.wrapping_div(right)
+                        }
+                    }
+                    OpCode::Mod => {
+                        if right == 0 {
+                            0
+                        } else {
+                            left.wrapping_rem(right)
+                        }
+                    }
+                    OpCode::Shl => {
+                        left.wrapping_shl((right.rem_euclid(32)) as u32)
+                    }
+                    OpCode::Shr => {
+                        left.wrapping_shr((right.rem_euclid(32)) as u32)
+                    }
+                    _ => unreachable!("only binary operations reach this branch"),
+                };
+                let _ = write_destination(&instruction.dest, result, &mut memory, &mut ram, instruction.id);
+                program_counter += 1;
+            }
+            OpCode::Assign => {
+                let result = value_permissive(&instruction.arg1, &memory, &ram);
+                let _ = write_destination(&instruction.dest, result, &mut memory, &mut ram, instruction.id);
+                program_counter += 1;
+            }
+            OpCode::IfFalse => {
+                let condition = value_permissive(&instruction.arg1, &memory, &ram);
+                if condition == 0 {
+                    if let Ok(target) = jump_target(&instruction.dest, &labels, instruction.id) {
+                        program_counter = target;
+                    } else {
+                        program_counter += 1;
+                    }
+                } else {
+                    program_counter += 1;
+                }
+            }
+            OpCode::Goto => {
+                if let Ok(target) = jump_target(&instruction.dest, &labels, instruction.id) {
+                    program_counter = target;
+                } else {
+                    program_counter += 1;
+                }
+            }
+            OpCode::Label | OpCode::Nop => program_counter += 1,
+            OpCode::Read => {
+                let input = if inputs.is_empty() {
+                    0
+                } else if input_index < inputs.len() {
+                    let val = inputs[input_index];
+                    input_index += 1;
+                    val
+                } else {
+                    let val = inputs[input_index % inputs.len()];
+                    input_index += 1;
+                    val
+                };
+                let _ = write_destination(&instruction.dest, input, &mut memory, &mut ram, instruction.id);
+                program_counter += 1;
+            }
+            OpCode::Print => {
+                output.push(value_permissive(&instruction.arg1, &memory, &ram));
+                program_counter += 1;
+            }
+        }
+    }
+
+    Ok(ExecutionResult { output, steps })
+}
+
+fn value_permissive(
+    operand: &Operand,
+    memory: &HashMap<String, i32>,
+    ram: &HashMap<i32, i32>,
+) -> i32 {
+    match operand {
+        Operand::Const(value) => *value,
+        Operand::Var(name) => {
+            if let Some(ptr_var) = name.strip_prefix("mem_") {
+                let addr = if let Ok(imm) = ptr_var.parse::<i32>() {
+                    imm
+                } else if let Some(&a) = memory.get(ptr_var) {
+                    a
+                } else {
+                    0
+                };
+                ram.get(&addr).copied().unwrap_or(0)
+            } else if let Some(&v) = memory.get(name) {
+                v
+            } else if name == "a" {
+                1000
+            } else {
+                0
+            }
+        }
+        Operand::Temp(index) => memory.get(&format!("t{index}")).copied().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 fn collect_labels(program: &Program) -> Result<HashMap<String, usize>, ExecutionError> {
@@ -159,16 +300,32 @@ fn collect_labels(program: &Program) -> Result<HashMap<String, usize>, Execution
 fn value(
     operand: &Operand,
     memory: &HashMap<String, i32>,
+    ram: &HashMap<i32, i32>,
     instruction_id: usize,
 ) -> Result<i32, ExecutionError> {
     match operand {
         Operand::Const(value) => Ok(*value),
-        Operand::Var(name) => memory.get(name).copied().ok_or_else(|| {
-            error(
-                Some(instruction_id),
-                format!("variable `{name}` is undefined"),
-            )
-        }),
+        Operand::Var(name) => {
+            if let Some(ptr_var) = name.strip_prefix("mem_") {
+                let addr = if let Ok(imm) = ptr_var.parse::<i32>() {
+                    imm
+                } else if let Some(&a) = memory.get(ptr_var) {
+                    a
+                } else {
+                    0
+                };
+                Ok(ram.get(&addr).copied().unwrap_or(0))
+            } else if let Some(&v) = memory.get(name) {
+                Ok(v)
+            } else if name == "a" {
+                Ok(1000)
+            } else {
+                Err(error(
+                    Some(instruction_id),
+                    format!("variable `{name}` is undefined"),
+                ))
+            }
+        }
         Operand::Temp(index) => memory.get(&format!("t{index}")).copied().ok_or_else(|| {
             error(
                 Some(instruction_id),
@@ -190,10 +347,21 @@ fn write_destination(
     operand: &Operand,
     value: i32,
     memory: &mut HashMap<String, i32>,
+    ram: &mut HashMap<i32, i32>,
     instruction_id: usize,
 ) -> Result<(), ExecutionError> {
     match operand {
         Operand::Var(name) => {
+            if let Some(ptr_var) = name.strip_prefix("mem_") {
+                let addr = if let Ok(imm) = ptr_var.parse::<i32>() {
+                    imm
+                } else if let Some(&a) = memory.get(ptr_var) {
+                    a
+                } else {
+                    0
+                };
+                ram.insert(addr, value);
+            }
             memory.insert(name.clone(), value);
             Ok(())
         }

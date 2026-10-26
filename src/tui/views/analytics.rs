@@ -601,7 +601,10 @@ fn render_analytics_metrics_summary(frame: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(COLOR_SUCCESS))
         .title(Line::from(vec![
-            Span::styled(" Section 5: Aggregate Benchmark Metrics & Correctness (50 Progs, 250 Vectors) ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" Section 5: Aggregate Benchmark Metrics & Correctness ({} Progs, {} Vectors) ", app.corpus.items.len(), total_vectors),
+                Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)
+            ),
         ]));
 
     let header = Row::new(vec![

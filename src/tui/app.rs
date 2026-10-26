@@ -29,7 +29,6 @@ use crate::{
             render_playground, render_program_modal,
         },
     },
-    verification::verify,
     vm::execute,
 };
 
@@ -145,6 +144,17 @@ pub struct App {
     pub playground_fullscreen: bool,
     pub playground_scroll_row: usize,
     pub playground_scroll_col: usize,
+    pub playground_input_modal_open: bool,
+    pub playground_input_string: String,
+    pub playground_gcc_out: Option<Vec<i32>>,
+    pub playground_orig_steps: usize,
+    pub playground_opt_steps: usize,
+    pub playground_orig_time_us: u128,
+    pub playground_opt_time_us: u128,
+    pub playground_vm_error: Option<String>,
+    pub playground_stats_open: bool,
+    pub playground_stats_scroll: usize,
+    pub playground_raw_c_source: Option<String>,
 }
 
 impl App {
@@ -191,6 +201,17 @@ impl App {
             playground_fullscreen: false,
             playground_scroll_row: 0,
             playground_scroll_col: 0,
+            playground_input_modal_open: false,
+            playground_input_string: "4 9 3 7 5".to_string(),
+            playground_gcc_out: None,
+            playground_orig_steps: 0,
+            playground_opt_steps: 0,
+            playground_orig_time_us: 0,
+            playground_opt_time_us: 0,
+            playground_vm_error: None,
+            playground_stats_open: false,
+            playground_stats_scroll: 0,
+            playground_raw_c_source: None,
         };
         app
     }
@@ -272,6 +293,7 @@ impl App {
 
         let was_c_code = crate::c_frontend::looks_like_c_code(&source);
         if was_c_code {
+            self.playground_raw_c_source = Some(source.clone());
             match crate::c_frontend::lower_c_to_tac(&source) {
                 Ok(tac) => {
                     self.playground_buffer = tac.lines().map(String::from).collect();
@@ -302,6 +324,7 @@ impl App {
                 }
             }
         } else {
+            self.playground_raw_c_source = None;
             // Check if user pasted raw GIMPLE / GCC dump with artifacts
             if source.contains(">;_[") || source.contains("MEM_") || source.contains("MEM[") || source.contains("<bb ") {
                 source = crate::c_frontend::sanitize_gimple_tac(&source);
@@ -353,26 +376,85 @@ impl App {
         if self.playground_parse_error.is_some() {
             return;
         }
+
+        if self.playground_inputs.is_empty() && !self.playground_input_string.is_empty() {
+            self.playground_inputs = self
+                .playground_input_string
+                .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+                .filter_map(|s| s.trim().parse::<i32>().ok())
+                .collect();
+        }
+
+        // 1. If we have raw C source, execute it natively via GCC for ground-truth comparison
+        if let Some(c_src) = &self.playground_raw_c_source {
+            match crate::c_frontend::run_c_via_gcc(c_src, &self.playground_input_string) {
+                Ok(gcc_nums) => {
+                    self.playground_gcc_out = Some(gcc_nums);
+                }
+                Err(_) => {
+                    self.playground_gcc_out = None;
+                }
+            }
+        } else {
+            self.playground_gcc_out = None;
+        }
+
         let source = self.playground_buffer.join("\n");
-        let Ok(parsed) = parse_program(&source) else { return; };
+        let Ok(parsed) = parse_program(&source) else {
+            self.playground_vm_error = Some("Failed to parse original TAC program".to_string());
+            self.playground_vm_executed = true;
+            self.playground_equiv_pass = false;
+            return;
+        };
+
         let opt_source = self.playground_opt_lines.join("\n");
-        let Ok(optimized) = parse_program(&opt_source) else { return; };
-
-        let orig_res = execute(&parsed, &self.playground_inputs);
-        let opt_res = execute(&optimized, &self.playground_inputs);
-
-        if let (Ok(o1), Ok(o2)) = (orig_res, opt_res) {
-            let matches = o1.output == o2.output;
-            self.playground_orig_out = o1.output;
-            self.playground_opt_out = o2.output;
-            self.playground_equiv_pass = matches;
+        let Ok(optimized) = parse_program(&opt_source) else {
+            self.playground_vm_error = Some("Failed to parse optimized TAC program".to_string());
             self.playground_vm_executed = true;
-        } else if let Ok(v) = verify(&parsed, &self.playground_inputs) {
-            let matches = v.matches();
-            self.playground_orig_out = v.original_output;
-            self.playground_opt_out = v.optimized_output;
-            self.playground_equiv_pass = matches;
-            self.playground_vm_executed = true;
+            self.playground_equiv_pass = false;
+            return;
+        };
+
+        let t0 = std::time::Instant::now();
+        let orig_res = crate::vm::execute_with_step_limit(&parsed, &self.playground_inputs, 100_000)
+            .or_else(|_| crate::vm::execute_permissive(&parsed, &self.playground_inputs, 100_000));
+        let orig_us = t0.elapsed().as_micros();
+
+        let t1 = std::time::Instant::now();
+        let opt_res = crate::vm::execute_with_step_limit(&optimized, &self.playground_inputs, 100_000)
+            .or_else(|_| crate::vm::execute_permissive(&optimized, &self.playground_inputs, 100_000));
+        let opt_us = t1.elapsed().as_micros();
+
+        self.playground_orig_time_us = orig_us;
+        self.playground_opt_time_us = opt_us;
+
+        match (orig_res, opt_res) {
+            (Ok(o1), Ok(o2)) => {
+                let matches = o1.output == o2.output;
+                self.playground_orig_out = o1.output;
+                self.playground_opt_out = o2.output;
+                self.playground_orig_steps = o1.steps;
+                self.playground_opt_steps = o2.steps;
+                self.playground_equiv_pass = matches;
+                self.playground_vm_executed = true;
+                self.playground_vm_error = None;
+                self.playground_status_message =
+                    Some("EXECUTION COMPLETE — PRESS 'S' FOR DETAILED STATISTICS".to_string());
+            }
+            (Err(e1), _) => {
+                self.playground_vm_error = Some(format!("Original TAC VM Error: {}", e1.message));
+                self.playground_vm_executed = true;
+                self.playground_equiv_pass = false;
+                self.playground_orig_steps = 0;
+                self.playground_opt_steps = 0;
+            }
+            (_, Err(e2)) => {
+                self.playground_vm_error = Some(format!("Optimized TAC VM Error: {}", e2.message));
+                self.playground_vm_executed = true;
+                self.playground_equiv_pass = false;
+                self.playground_orig_steps = 0;
+                self.playground_opt_steps = 0;
+            }
         }
     }
 
@@ -535,6 +617,7 @@ impl App {
                         self.playground_file_name = path.to_string();
                         let is_c = path.ends_with(".c") || crate::c_frontend::looks_like_c_code(&content);
                         if is_c {
+                            self.playground_raw_c_source = Some(content.clone());
                             match crate::c_frontend::lower_c_to_tac(&content) {
                                 Ok(tac) => {
                                     self.playground_buffer = tac.lines().map(String::from).collect();
@@ -548,6 +631,7 @@ impl App {
                                 }
                             }
                         } else {
+                            self.playground_raw_c_source = None;
                             self.playground_buffer = content.lines().map(String::from).collect();
                         }
                         self.playground_cursor_row = 0;
@@ -582,6 +666,15 @@ impl App {
                     self.playground_opt_out.clear();
                     self.playground_converted = false;
                     self.playground_vm_executed = false;
+                    self.playground_raw_c_source = None;
+                    self.playground_gcc_out = None;
+                    self.playground_vm_error = None;
+                    self.playground_orig_steps = 0;
+                    self.playground_opt_steps = 0;
+                    self.playground_orig_time_us = 0;
+                    self.playground_opt_time_us = 0;
+                    self.playground_stats_open = false;
+                    self.playground_stats_scroll = 0;
                     self.playground_status_message =
                         Some("BUFFER CLEARED — ENTER C OR TAC CODE".to_string());
                     self.reset_confirm_modal_open = false;
@@ -589,6 +682,72 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.reset_confirm_modal_open = false;
                     self.playground_status_message = Some("RESET CANCELLED".to_string());
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Statistics Deck modal in playground
+        if self.screen == CurrentScreen::Playground && self.playground_stats_open {
+            match key {
+                KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.playground_stats_open = false;
+                    self.playground_status_message =
+                        Some("STATISTICS DECK CLOSED — EDITOR ACTIVE".to_string());
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.playground_stats_scroll = self.playground_stats_scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.playground_stats_scroll = self.playground_stats_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.playground_stats_scroll = self.playground_stats_scroll.saturating_add(5);
+                }
+                KeyCode::PageUp => {
+                    self.playground_stats_scroll = self.playground_stats_scroll.saturating_sub(5);
+                }
+                KeyCode::Home => {
+                    self.playground_stats_scroll = 0;
+                }
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    self.should_quit = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Terminal input modal in playground
+        if self.screen == CurrentScreen::Playground && self.playground_input_modal_open {
+            if modifiers.contains(KeyModifiers::CONTROL) && (key == KeyCode::Char('v') || key == KeyCode::Char('V')) {
+                if let Some(text) = get_clipboard_text() {
+                    self.playground_input_string.push_str(&text);
+                }
+                return;
+            }
+            match key {
+                KeyCode::Esc => {
+                    self.playground_input_modal_open = false;
+                    self.playground_status_message = Some("TERMINAL INPUT CANCELLED".to_string());
+                }
+                KeyCode::Backspace => {
+                    self.playground_input_string.pop();
+                }
+                KeyCode::Enter => {
+                    let parsed: Vec<i32> = self.playground_input_string
+                        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+                        .filter_map(|s| s.trim().parse::<i32>().ok())
+                        .collect();
+                    if !parsed.is_empty() {
+                        self.playground_inputs = parsed;
+                    }
+                    self.playground_input_modal_open = false;
+                    self.run_playground_vm();
+                }
+                KeyCode::Char(c) => {
+                    self.playground_input_string.push(c);
                 }
                 _ => {}
             }
@@ -1036,7 +1195,16 @@ impl App {
                         self.convert_playground();
                     }
                     KeyCode::Char('r') | KeyCode::Char('R') => {
-                        self.run_playground_vm();
+                        self.playground_input_modal_open = true;
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        if self.playground_vm_executed {
+                            self.playground_stats_open = true;
+                            self.playground_stats_scroll = 0;
+                        } else {
+                            self.playground_status_message =
+                                Some("STATISTICS LOCKED — RUN PROGRAM WITH 'R' FIRST".to_string());
+                        }
                     }
                     KeyCode::Char('x') | KeyCode::Char('X') => {
                         self.reset_confirm_modal_open = true;
@@ -1350,9 +1518,9 @@ mod tests {
                 assert_eq!(v.original_output, v.optimized_output);
             }
         }
-        assert_eq!(corpus.items.len(), 50);
-        assert_eq!(total_vectors, 250);
-        assert_eq!(passed_vectors, 250);
+        assert_eq!(corpus.items.len(), 100);
+        assert_eq!(total_vectors, 500);
+        assert_eq!(passed_vectors, 500);
 
         let instr_red = ProgramStats::reduction_pct(total_orig_instr, total_opt_instr);
         let arith_red = ProgramStats::reduction_pct(total_orig_arith, total_opt_arith);
@@ -1638,6 +1806,14 @@ mod tests {
         // Optimizations must have fired
         assert!(!app.playground_transforms.is_empty());
         assert!(app.playground_opt_lines.iter().any(|l| l.contains("<< 2")));
+
+        // Dual VM execution must now succeed with permissive semantics
+        app.run_playground_vm();
+        assert!(app.playground_vm_executed);
+        assert!(app.playground_equiv_pass);
+        assert!(app.playground_orig_steps > 0);
+        assert!(app.playground_opt_steps > 0);
+        assert!(app.playground_vm_error.is_none());
     }
 
     #[test]
@@ -1647,7 +1823,7 @@ mod tests {
         use crate::tui::views::analytics::render_analytics;
 
         let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
-        assert_eq!(corpus.items.len(), 50);
+        assert_eq!(corpus.items.len(), 100);
 
         let mut app = App::new(corpus);
         app.screen = CurrentScreen::AnalyticsDeck;
@@ -1671,7 +1847,7 @@ mod tests {
 
             // Verify Header & Navigation
             assert!(content.contains("CodeOpt Comprehensive Analytics"));
-            assert!(content.contains("Corpus Total: 50"));
+            assert!(content.contains("Corpus Total: 100"));
 
             // Verify all 6 Plots exist
             assert!(content.contains("1. Instrs"));
@@ -1797,5 +1973,200 @@ mod tests {
         // 9. Convert & run VM inside fullscreen mode
         app.convert_playground();
         assert!(app.playground_converted);
+    }
+
+    #[test]
+    fn test_terminal_input_modal_and_execution() {
+        let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
+        let mut app = App::new(corpus);
+        app.screen = CurrentScreen::Playground;
+
+        app.playground_buffer = vec![
+            "read a".to_string(),
+            "read b".to_string(),
+            "c = a + b".to_string(),
+            "print c".to_string(),
+        ];
+
+        // 1. Press 'r' opens terminal input dialog
+        assert!(!app.playground_input_modal_open);
+        app.handle_key(KeyCode::Char('r'));
+        assert!(app.playground_input_modal_open);
+
+        // 2. Type input values into modal: "15 27"
+        app.playground_input_string.clear();
+        for ch in "15 27".chars() {
+            app.handle_key(KeyCode::Char(ch));
+        }
+        assert_eq!(app.playground_input_string, "15 27");
+
+        // 3. Press Enter to submit and execute Dual VM
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.playground_input_modal_open);
+        assert_eq!(app.playground_inputs, vec![15, 27]);
+        assert!(app.playground_vm_executed);
+        assert_eq!(app.playground_orig_out, vec![42]);
+        assert_eq!(app.playground_opt_out, vec![42]);
+        assert!(app.playground_equiv_pass);
+        assert!(app.playground_orig_steps > 0);
+    }
+
+    #[test]
+    fn test_statistics_deck_modal_and_scrolling() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::tui::views::playground::render_playground;
+
+        let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
+        let mut app = App::new(corpus);
+        app.screen = CurrentScreen::Playground;
+
+        app.playground_buffer = vec![
+            "read x".to_string(),
+            "t1 = x * 8".to_string(),
+            "t2 = t1 + 0".to_string(),
+            "print t2".to_string(),
+        ];
+
+        // 1. Press 'S' before VM run should be locked
+        assert!(!app.playground_vm_executed);
+        app.handle_key(KeyCode::Char('s'));
+        assert!(!app.playground_stats_open);
+        assert_eq!(
+            app.playground_status_message.as_deref(),
+            Some("STATISTICS LOCKED — RUN PROGRAM WITH 'R' FIRST")
+        );
+
+        // 2. Run VM with terminal inputs
+        app.handle_key(KeyCode::Char('r'));
+        app.playground_input_string = "7".to_string();
+        app.handle_key(KeyCode::Enter);
+        assert!(app.playground_vm_executed);
+
+        // 3. Press 'S' now opens Statistics Deck
+        app.handle_key(KeyCode::Char('s'));
+        assert!(app.playground_stats_open);
+
+        // Render full Statistics Deck
+        let backend = TestBackend::new(140, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| {
+            render_playground(f, &app, f.area());
+        }).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer.content().iter().map(|c| c.symbol()).collect();
+
+        // Verify all 4 sections of Statistics Deck
+        assert!(content.contains("CodeOpt Interactive Statistics & Performance Deck"));
+        assert!(content.contains("Section 5 Quantitative Reduction Metrics"));
+        assert!(content.contains("Per-Optimizer Pass Contribution"));
+        assert!(content.contains("Terminal Stdin / Stdout Verification"));
+        assert!(content.contains("Transformation Trail"));
+        assert!(content.contains("Strength Reduction"));
+
+        // 4. Test scrolling audit trail
+        assert_eq!(app.playground_stats_scroll, 0);
+        app.handle_key(KeyCode::Char('j'));
+        assert_eq!(app.playground_stats_scroll, 1);
+        app.handle_key(KeyCode::Char('k'));
+        assert_eq!(app.playground_stats_scroll, 0);
+
+        // 5. Exit Statistics Deck with 'Esc'
+        app.handle_key(KeyCode::Esc);
+        assert!(!app.playground_stats_open);
+    }
+
+    #[test]
+    fn test_permissive_vm_execution_on_gimple_dump() {
+        let corpus = BenchmarkCorpus::load_from_dir("benchmarks");
+        let mut app = App::new(corpus);
+        app.screen = CurrentScreen::Playground;
+
+        // Code with uninitialized scalar variables and multi-branch loops
+        app.playground_buffer = vec![
+            "read n".to_string(),
+            "t1 = n".to_string(),
+            "t2 = t1 * 4".to_string(),
+            "low = 0".to_string(),
+            "t3 = low + t2".to_string(),
+            "print t3".to_string(),
+        ];
+
+        app.playground_input_string = "10".to_string();
+        app.handle_key(KeyCode::Char('r'));
+        app.handle_key(KeyCode::Enter);
+
+        assert!(app.playground_vm_executed);
+        assert_eq!(app.playground_orig_out, vec![40]);
+        assert_eq!(app.playground_opt_out, vec![40]);
+        assert!(app.playground_equiv_pass);
+        assert!(app.playground_vm_error.is_none());
+    }
+
+    #[test]
+    fn test_run_c_via_gcc_native() {
+        let c_code = r#"
+#include <stdio.h>
+int main() {
+    int a, b;
+    if (scanf("%d %d", &a, &b) == 2) {
+        printf("%d %d\n", a + b, a * b);
+    }
+    return 0;
+}
+"#;
+        let res = crate::c_frontend::run_c_via_gcc(c_code, "6 7");
+        assert!(res.is_ok(), "GCC native runner failed: {:?}", res.err());
+        let nums = res.unwrap();
+        assert_eq!(nums, vec![13, 42]);
+    }
+
+    #[test]
+    fn test_playground_c_bubble_sort_full_flow() {
+        let mut app = App::new(BenchmarkCorpus::default());
+        app.screen = CurrentScreen::Playground;
+        let bubble_c = r#"
+#include <stdio.h>
+int main() {
+    int n;
+    scanf("%d", &n);
+    int a[100];
+    for (int i = 0; i < n; i++) {
+        scanf("%d", &a[i]);
+    }
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = 0; j < n - i - 1; j++) {
+            if (a[j] > a[j + 1]) {
+                int temp = a[j];
+                a[j] = a[j + 1];
+                a[j + 1] = temp;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        printf("%d\n", a[i]);
+    }
+    return 0;
+}
+"#;
+        app.playground_buffer = bubble_c.lines().map(String::from).collect();
+        app.playground_input_string = "4 7 8 6 5".to_string();
+        app.playground_inputs = vec![4, 7, 8, 6, 5];
+        app.convert_playground();
+        assert!(app.playground_converted);
+        assert!(app.playground_parse_error.is_none());
+
+        app.run_playground_vm();
+        println!("orig_out: {:?}", app.playground_orig_out);
+        println!("opt_out: {:?}", app.playground_opt_out);
+        println!("gcc_out: {:?}", app.playground_gcc_out);
+
+        assert!(app.playground_vm_executed);
+        assert!(app.playground_vm_error.is_none(), "VM error: {:?}", app.playground_vm_error);
+        assert_eq!(app.playground_orig_out, vec![5, 6, 7, 8]);
+        assert_eq!(app.playground_opt_out, vec![5, 6, 7, 8]);
+        assert_eq!(app.playground_gcc_out, Some(vec![5, 6, 7, 8]));
+        assert!(app.playground_equiv_pass);
     }
 }

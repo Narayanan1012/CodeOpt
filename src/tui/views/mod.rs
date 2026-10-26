@@ -3,6 +3,7 @@ pub mod benchmarks;
 pub mod home;
 pub mod optimizing;
 pub mod playground;
+pub mod playground_stats;
 pub mod program_modal;
 
 pub use analytics::render_analytics;
@@ -10,4 +11,5 @@ pub use benchmarks::render_benchmarks;
 pub use home::render_home;
 pub use optimizing::render_optimizing;
 pub use playground::render_playground;
+pub use playground_stats::render_playground_stats;
 pub use program_modal::render_program_modal;

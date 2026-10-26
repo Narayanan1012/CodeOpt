@@ -871,6 +871,18 @@ fn is_simple_operand(s: &str) -> bool {
 // Tier 2: GCC GIMPLE Bridge (Strictly Dormant Backup)
 // ============================================================================
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+static GIMPLE_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+    let count = GIMPLE_TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("{prefix}_{}_{}_{}", std::process::id(), nanos, count))
+}
+
 /// Invokes GCC to dump GIMPLE intermediate representation and converts it to TAC.
 ///
 /// STRICTLY DORMANT: This function must never be called during standard execution,
@@ -882,7 +894,7 @@ pub fn lower_c_via_gcc_backup(c_file_path: &str) -> Result<String, String> {
         return Err(format!("File does not exist: `{c_file_path}`"));
     }
 
-    let temp_dir = std::env::temp_dir().join(format!("codeopt_gimple_{}", std::process::id()));
+    let temp_dir = unique_temp_dir("codeopt_gimple");
     fs::create_dir_all(&temp_dir)
         .map_err(|e| format!("Could not create temporary directory: {e}"))?;
 
@@ -945,7 +957,7 @@ pub fn lower_c_via_gcc_backup(c_file_path: &str) -> Result<String, String> {
 
 /// Lowers raw in-memory C source text to TAC via the dormant GCC backup compiler.
 pub fn lower_c_source_via_gcc_backup(c_source: &str) -> Result<String, String> {
-    let temp_dir = std::env::temp_dir().join(format!("codeopt_gimple_src_{}", std::process::id()));
+    let temp_dir = unique_temp_dir("codeopt_gimple_src");
     fs::create_dir_all(&temp_dir)
         .map_err(|e| format!("Could not create temporary directory: {e}"))?;
     let temp_c_path = temp_dir.join("input.c");
@@ -954,6 +966,67 @@ pub fn lower_c_source_via_gcc_backup(c_source: &str) -> Result<String, String> {
     let res = lower_c_via_gcc_backup(&temp_c_path.to_string_lossy());
     let _ = fs::remove_dir_all(&temp_dir);
     res
+}
+
+/// Compiles C source code with GCC and executes the resulting binary with user stdin,
+/// returning the integers printed to stdout.
+pub fn run_c_via_gcc(c_source: &str, stdin_input: &str) -> Result<Vec<i32>, String> {
+    let temp_dir = unique_temp_dir("codeopt_run_gcc");
+    fs::create_dir_all(&temp_dir).map_err(|e| format!("Failed to create temp dir: {e}"))?;
+    let src_path = temp_dir.join("main.c");
+    let bin_path = temp_dir.join("main.out");
+    fs::write(&src_path, c_source).map_err(|e| format!("Failed to write C source: {e}"))?;
+
+    let compile = Command::new("gcc")
+        .arg("-O1")
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .output()
+        .map_err(|e| format!("GCC invocation failed: {e}"))?;
+
+    if !compile.status.success() {
+        let _ = fs::remove_dir_all(&temp_dir);
+        let err = String::from_utf8_lossy(&compile.stderr);
+        return Err(format!("GCC compilation failed: {err}"));
+    }
+
+    use std::io::Write;
+    let mut attempts = 0;
+    let mut child = loop {
+        match Command::new(&bin_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => break c,
+            Err(_e) if attempts < 5 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            Err(e) => {
+                let _ = fs::remove_dir_all(&temp_dir);
+                return Err(format!("Failed to spawn native executable: {e}"));
+            }
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(stdin_input.as_bytes());
+        let _ = stdin.write_all(b"\n");
+    }
+
+    let output = child.wait_with_output().map_err(|e| format!("Execution failed: {e}"))?;
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let numbers: Vec<i32> = stdout_str
+        .split_whitespace()
+        .filter_map(|s| s.parse::<i32>().ok())
+        .collect();
+
+    Ok(numbers)
 }
 
 fn clean_gimple_label(raw: &str) -> String {
@@ -997,36 +1070,263 @@ fn extract_goto_target(s: &str) -> Option<String> {
     None
 }
 
-fn lower_gimple_condition(
-    cond: &str,
-    temp_map: &mut HashMap<String, String>,
-    temp_count: &mut usize,
-    pointer_map: &HashMap<String, String>,
-    tac_lines: &mut Vec<String>,
-) -> String {
-    let normalized = cond.replace("< =", "<=").replace("> =", ">=").replace("= =", "==").replace("! =", "!=");
-    let trimmed = normalized.trim();
-    for op in &["<=", ">=", "==", "!=", "<", ">"] {
-        if let Some(pos) = trimmed.find(op) {
-            let left = trimmed[..pos].trim();
-            let right = trimmed[pos + op.len()..].trim();
-            let cl_left = clean_gimple_token(left, temp_map, temp_count, pointer_map);
-            let cl_right = clean_gimple_token(right, temp_map, temp_count, pointer_map);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelOp {
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    Eq,
+    Ne,
+}
 
-            if *op == "==" && cl_right == "0" {
-                return cl_left;
-            }
-            *temp_count += 1;
-            let cond_temp = format!("t{}", *temp_count);
-            tac_lines.push(format!("{cond_temp} = {cl_left} - {cl_right}"));
-            return cond_temp;
+pub fn parse_relational_expr(expr: &str) -> (Option<RelOp>, String, String) {
+    let normalized = expr
+        .replace("< =", "<=")
+        .replace("> =", ">=")
+        .replace("= =", "==")
+        .replace("! =", "!=");
+    let trimmed = normalized.trim();
+    for (op_str, op) in &[
+        ("<=", RelOp::Le),
+        (">=", RelOp::Ge),
+        ("==", RelOp::Eq),
+        ("!=", RelOp::Ne),
+        ("<", RelOp::Lt),
+        (">", RelOp::Gt),
+    ] {
+        if let Some(pos) = trimmed.find(op_str) {
+            let left = trimmed[..pos].trim();
+            let right = trimmed[pos + op_str.len()..].trim();
+            return (Some(*op), left.to_string(), right.to_string());
         }
     }
+    (None, trimmed.to_string(), "0".to_string())
+}
 
-    if let Some(inner) = trimmed.strip_prefix('!') {
-        clean_gimple_token(inner, temp_map, temp_count, pointer_map)
-    } else {
-        clean_gimple_token(trimmed, temp_map, temp_count, pointer_map)
+fn emit_relational_branch(
+    op: Option<RelOp>,
+    left: &str,
+    right: &str,
+    current_label: &str,
+    then_target: &str,
+    else_target: &str,
+    edge_assignments: &HashMap<(String, String), Vec<(String, String)>>,
+    temp_count: &mut usize,
+    tac_lines: &mut Vec<String>,
+    defined_labels: &mut HashSet<String>,
+    referenced_labels: &mut HashSet<String>,
+) {
+    let then_edges = edge_assignments.get(&(current_label.to_string(), then_target.to_string()));
+    let else_edges = edge_assignments.get(&(current_label.to_string(), else_target.to_string()));
+
+    let has_then_edges = then_edges.map_or(false, |v| !v.is_empty());
+    let has_else_edges = else_edges.map_or(false, |v| !v.is_empty());
+
+    match op {
+        Some(RelOp::Eq) => {
+            *temp_count += 1;
+            let t_diff = format!("t{}", *temp_count);
+            tac_lines.push(format!("{t_diff} = {left} - {right}"));
+
+            if has_then_edges {
+                let trampoline = format!("bb_edge_{}_{}", current_label, then_target);
+                referenced_labels.insert(trampoline.clone());
+                tac_lines.push(format!("if_false {t_diff} goto {trampoline}"));
+
+                if let Some(edges) = else_edges {
+                    for (d, v) in edges {
+                        tac_lines.push(format!("{d} = {v}"));
+                    }
+                }
+                referenced_labels.insert(else_target.to_string());
+                tac_lines.push(format!("goto {else_target}"));
+
+                defined_labels.insert(trampoline.clone());
+                tac_lines.push(format!("{trampoline}:"));
+                if let Some(edges) = then_edges {
+                    for (d, v) in edges {
+                        tac_lines.push(format!("{d} = {v}"));
+                    }
+                }
+                referenced_labels.insert(then_target.to_string());
+                tac_lines.push(format!("goto {then_target}"));
+            } else {
+                referenced_labels.insert(then_target.to_string());
+                tac_lines.push(format!("if_false {t_diff} goto {then_target}"));
+
+                if let Some(edges) = else_edges {
+                    for (d, v) in edges {
+                        tac_lines.push(format!("{d} = {v}"));
+                    }
+                }
+                referenced_labels.insert(else_target.to_string());
+                tac_lines.push(format!("goto {else_target}"));
+            }
+        }
+        _ => {
+            *temp_count += 1;
+            let t_diff = format!("t{}", *temp_count);
+            *temp_count += 1;
+            let t_sign = format!("t{}", *temp_count);
+            *temp_count += 1;
+            let t_cond = format!("t{}", *temp_count);
+
+            let is_inverted = match op {
+                Some(RelOp::Lt) => {
+                    tac_lines.push(format!("{t_diff} = {left} - {right}"));
+                    tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+                    tac_lines.push(format!("{t_cond} = 0 - {t_sign}"));
+                    false
+                }
+                Some(RelOp::Gt) => {
+                    tac_lines.push(format!("{t_diff} = {right} - {left}"));
+                    tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+                    tac_lines.push(format!("{t_cond} = 0 - {t_sign}"));
+                    false
+                }
+                Some(RelOp::Le) => {
+                    tac_lines.push(format!("{t_diff} = {right} - {left}"));
+                    tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+                    *temp_count += 1;
+                    let t_gt = format!("t{}", *temp_count);
+                    tac_lines.push(format!("{t_gt} = 0 - {t_sign}"));
+                    tac_lines.push(format!("{t_cond} = 1 - {t_gt}"));
+                    false
+                }
+                Some(RelOp::Ge) => {
+                    tac_lines.push(format!("{t_diff} = {left} - {right}"));
+                    tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+                    *temp_count += 1;
+                    let t_lt = format!("t{}", *temp_count);
+                    tac_lines.push(format!("{t_lt} = 0 - {t_sign}"));
+                    tac_lines.push(format!("{t_cond} = 1 - {t_lt}"));
+                    false
+                }
+                Some(RelOp::Ne) => {
+                    tac_lines.push(format!("{t_cond} = {left} - {right}"));
+                    false
+                }
+                Some(RelOp::Eq) => unreachable!("handled in outer match"),
+                None => {
+                    if let Some(inner) = left.strip_prefix('!') {
+                        tac_lines.push(format!("{t_cond} = {inner}"));
+                        true
+                    } else {
+                        tac_lines.push(format!("{t_cond} = {left}"));
+                        false
+                    }
+                }
+            };
+
+            let (jump_target, fall_target, jump_edges, fall_edges, has_jump_edges) = if is_inverted {
+                (then_target, else_target, then_edges, else_edges, has_then_edges)
+            } else {
+                (else_target, then_target, else_edges, then_edges, has_else_edges)
+            };
+
+            if has_jump_edges {
+                let trampoline = format!("bb_edge_{}_{}", current_label, jump_target);
+                referenced_labels.insert(trampoline.clone());
+                tac_lines.push(format!("if_false {t_cond} goto {trampoline}"));
+
+                if let Some(edges) = fall_edges {
+                    for (d, v) in edges {
+                        tac_lines.push(format!("{d} = {v}"));
+                    }
+                }
+                referenced_labels.insert(fall_target.to_string());
+                tac_lines.push(format!("goto {fall_target}"));
+
+                defined_labels.insert(trampoline.clone());
+                tac_lines.push(format!("{trampoline}:"));
+                if let Some(edges) = jump_edges {
+                    for (d, v) in edges {
+                        tac_lines.push(format!("{d} = {v}"));
+                    }
+                }
+                referenced_labels.insert(jump_target.to_string());
+                tac_lines.push(format!("goto {jump_target}"));
+            } else {
+                referenced_labels.insert(jump_target.to_string());
+                tac_lines.push(format!("if_false {t_cond} goto {jump_target}"));
+
+                if let Some(edges) = fall_edges {
+                    for (d, v) in edges {
+                        tac_lines.push(format!("{d} = {v}"));
+                    }
+                }
+                referenced_labels.insert(fall_target.to_string());
+                tac_lines.push(format!("goto {fall_target}"));
+            }
+        }
+    }
+}
+
+fn emit_relational_assignment(
+    lhs: &str,
+    op: RelOp,
+    left: &str,
+    right: &str,
+    temp_count: &mut usize,
+    tac_lines: &mut Vec<String>,
+) {
+    *temp_count += 1;
+    let t_diff = format!("t{}", *temp_count);
+    *temp_count += 1;
+    let t_sign = format!("t{}", *temp_count);
+
+    match op {
+        RelOp::Lt => {
+            tac_lines.push(format!("{t_diff} = {left} - {right}"));
+            tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+            tac_lines.push(format!("{lhs} = 0 - {t_sign}"));
+        }
+        RelOp::Gt => {
+            tac_lines.push(format!("{t_diff} = {right} - {left}"));
+            tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+            tac_lines.push(format!("{lhs} = 0 - {t_sign}"));
+        }
+        RelOp::Le => {
+            tac_lines.push(format!("{t_diff} = {right} - {left}"));
+            tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+            *temp_count += 1;
+            let t_gt = format!("t{}", *temp_count);
+            tac_lines.push(format!("{t_gt} = 0 - {t_sign}"));
+            tac_lines.push(format!("{lhs} = 1 - {t_gt}"));
+        }
+        RelOp::Ge => {
+            tac_lines.push(format!("{t_diff} = {left} - {right}"));
+            tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+            *temp_count += 1;
+            let t_lt = format!("t{}", *temp_count);
+            tac_lines.push(format!("{t_lt} = 0 - {t_sign}"));
+            tac_lines.push(format!("{lhs} = 1 - {t_lt}"));
+        }
+        RelOp::Eq => {
+            *temp_count += 1;
+            let lbl_eq = format!("bb_eq_{}", *temp_count);
+            let lbl_end = format!("bb_end_{}", *temp_count);
+            tac_lines.push(format!("{lhs} = 0"));
+            tac_lines.push(format!("{t_diff} = {left} - {right}"));
+            tac_lines.push(format!("if_false {t_diff} goto {lbl_eq}"));
+            tac_lines.push(format!("goto {lbl_end}"));
+            tac_lines.push(format!("{lbl_eq}:"));
+            tac_lines.push(format!("{lhs} = 1"));
+            tac_lines.push(format!("{lbl_end}:"));
+        }
+        RelOp::Ne => {
+            *temp_count += 1;
+            let lbl_eq = format!("bb_eq_{}", *temp_count);
+            let lbl_end = format!("bb_end_{}", *temp_count);
+            tac_lines.push(format!("{lhs} = 1"));
+            tac_lines.push(format!("{t_diff} = {left} - {right}"));
+            tac_lines.push(format!("if_false {t_diff} goto {lbl_eq}"));
+            tac_lines.push(format!("goto {lbl_end}"));
+            tac_lines.push(format!("{lbl_eq}:"));
+            tac_lines.push(format!("{lhs} = 0"));
+            tac_lines.push(format!("{lbl_end}:"));
+        }
     }
 }
 
@@ -1089,9 +1389,12 @@ fn clean_gimple_token(
         return cleaned;
     }
 
-    // Check if it's already a clean integer constant (including negative)
-    if token.parse::<i32>().is_ok() {
-        return token.to_string();
+    // Check if it's already a clean integer constant (including negative and wrapped u32)
+    if let Ok(val) = token.parse::<i32>() {
+        return val.to_string();
+    }
+    if let Ok(val) = token.parse::<u32>() {
+        return (val as i32).to_string();
     }
 
     // Compiler temporaries: _1, x.1_2, D.3440, ivtmp.27_54, etc.
@@ -1119,20 +1422,116 @@ fn clean_gimple_token(
     }
 }
 
+#[derive(Debug, Clone)]
+struct GimpleRawBlock {
+    label: String,
+    phis: Vec<(String, String, String)>,
+    stmts: Vec<String>,
+}
+
+fn lower_mem_expr(
+    raw: &str,
+    temp_map: &mut HashMap<String, String>,
+    temp_count: &mut usize,
+    pointer_map: &HashMap<String, String>,
+    tac_lines: &mut Vec<String>,
+) -> String {
+    let s = raw.trim();
+
+    // Case 1: unoptimized array indexing: arr[idx]
+    if !s.starts_with("MEM") && s.contains('[') && s.ends_with(']') {
+        if let Some(open_b) = s.find('[') {
+            let base = s[..open_b].trim();
+            let idx = s[open_b + 1..s.len() - 1].trim();
+            let c_base = clean_gimple_token(base, temp_map, temp_count, pointer_map);
+            let c_idx = clean_gimple_token(idx, temp_map, temp_count, pointer_map);
+
+            *temp_count += 1;
+            let t_sc = format!("t{}", *temp_count);
+            tac_lines.push(format!("{t_sc} = {c_idx} * 4"));
+
+            *temp_count += 1;
+            let t_ad = format!("t{}", *temp_count);
+            tac_lines.push(format!("{t_ad} = {c_base} + {t_sc}"));
+
+            return format!("mem_{t_ad}");
+        }
+    }
+
+    // Case 2: MEM[...]
+    if s.starts_with("MEM") {
+        if let (Some(ob), Some(cb)) = (s.rfind('['), s.rfind(']')) {
+            if cb > ob {
+                let mut inner = s[ob + 1..cb].trim();
+                while inner.starts_with('(') {
+                    if let Some(cp) = inner.find(')') {
+                        inner = inner[cp + 1..].trim();
+                    } else {
+                        break;
+                    }
+                }
+
+                if inner.contains(" + ") {
+                    let parts: Vec<&str> = inner.split(" + ").collect();
+                    let base = parts[0].trim().trim_start_matches('&');
+                    let rest = parts[1].trim();
+                    let c_base = clean_gimple_token(base, temp_map, temp_count, pointer_map);
+
+                    if rest.contains(" * ") {
+                        let mult: Vec<&str> = rest.split(" * ").collect();
+                        let idx = mult[0].trim();
+                        let scale = mult[1].trim();
+                        let c_idx = clean_gimple_token(idx, temp_map, temp_count, pointer_map);
+                        let c_scale = clean_gimple_token(scale, temp_map, temp_count, pointer_map);
+
+                        *temp_count += 1;
+                        let t_sc = format!("t{}", *temp_count);
+                        tac_lines.push(format!("{t_sc} = {c_idx} * {c_scale}"));
+
+                        *temp_count += 1;
+                        let t_ad = format!("t{}", *temp_count);
+                        tac_lines.push(format!("{t_ad} = {c_base} + {t_sc}"));
+
+                        return format!("mem_{t_ad}");
+                    } else {
+                        let offset = rest.trim_end_matches('B').trim();
+                        let c_off = clean_gimple_token(offset, temp_map, temp_count, pointer_map);
+
+                        *temp_count += 1;
+                        let t_ad = format!("t{}", *temp_count);
+                        tac_lines.push(format!("{t_ad} = {c_base} + {c_off}"));
+
+                        return format!("mem_{t_ad}");
+                    }
+                } else {
+                    let ptr = inner.trim_start_matches('&').trim();
+                    let c_ptr = clean_gimple_token(ptr, temp_map, temp_count, pointer_map);
+                    return format!("mem_{c_ptr}");
+                }
+            }
+        }
+    }
+
+    let cleaned = clean_gimple_token(s, temp_map, temp_count, pointer_map);
+    format!("mem_{cleaned}")
+}
+
 fn parse_gimple_to_tac(gimple_source: &str) -> Result<String, String> {
-    let mut tac_lines = Vec::new();
     let mut temp_map: HashMap<String, String> = HashMap::new();
     let mut pointer_map: HashMap<String, String> = HashMap::new();
     let mut temp_count = 0;
     let mut defined_labels: HashSet<String> = HashSet::new();
     let mut referenced_labels: HashSet<String> = HashSet::new();
 
+    let mut blocks: Vec<GimpleRawBlock> = Vec::new();
+    let mut current_block: Option<GimpleRawBlock> = None;
     let mut in_main = false;
+    let mut array_declarations: Vec<String> = Vec::new();
     let lines: Vec<&str> = gimple_source.lines().map(str::trim).collect();
     let mut i = 0;
 
     while i < lines.len() {
-        let line = lines[i];
+        let mut line = lines[i].to_string();
         i += 1;
 
         if line.contains("main ()") || line.contains("main (") {
@@ -1141,13 +1540,92 @@ fn parse_gimple_to_tac(gimple_source: &str) -> Result<String, String> {
         }
 
         // If another function starts after main, stop
-        if in_main && (line.starts_with(";; Function") || (line.ends_with(')') && line.contains('(') && !line.starts_with("if") && !line.starts_with("scanf") && !line.starts_with("printf"))) {
+        if in_main
+            && (line.starts_with(";; Function")
+                || (line.ends_with(')')
+                    && line.contains('(')
+                    && !line.starts_with("if")
+                    && !line.starts_with("scanf")
+                    && !line.starts_with("printf")))
+        {
             if !line.contains("main") {
                 break;
             }
         }
 
         if !in_main {
+            continue;
+        }
+
+        if line.starts_with("int ") && line.contains('[') && line.contains(']') {
+            let after = line.trim_start_matches("int ").trim();
+            for part in after.split(',') {
+                let part = part.trim();
+                if let Some(open) = part.find('[') {
+                    let name = part[..open].trim();
+                    if !name.is_empty() && !array_declarations.contains(&name.to_string()) {
+                        array_declarations.push(name.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Basic block label: <bb 2> [local count: ...]: or <bb 3>: or <D.3486>: or label:
+        if (line.starts_with("<bb ")
+            || line.starts_with("<D.")
+            || line.starts_with("bb_")
+            || line.ends_with(':'))
+            && line.contains(':')
+        {
+            if let Some(b) = current_block.take() {
+                blocks.push(b);
+            }
+            let lbl = clean_gimple_label(&line);
+            current_block = Some(GimpleRawBlock {
+                label: lbl,
+                phis: Vec::new(),
+                stmts: Vec::new(),
+            });
+            continue;
+        }
+
+        let Some(ref mut cur) = current_block else {
+            continue;
+        };
+
+        // PHI node: # dest = PHI <val1(pred1), val2(pred2), ...>
+        if line.starts_with("# ") && line.contains("= PHI <") {
+            while !line.contains('>') && i < lines.len() {
+                line.push(' ');
+                line.push_str(lines[i]);
+                i += 1;
+            }
+            if let (Some(eq_pos), Some(open_b), Some(close_b)) =
+                (line.find("= PHI <"), line.find('<'), line.rfind('>'))
+            {
+                let raw_lhs = line[2..eq_pos].trim();
+                let clean_lhs =
+                    clean_gimple_token(raw_lhs, &mut temp_map, &mut temp_count, &pointer_map);
+                let args_str = &line[open_b + 1..close_b];
+                for entry in args_str.split(',') {
+                    let entry = entry.trim();
+                    if let (Some(op), Some(cp)) = (entry.find('('), entry.rfind(')')) {
+                        if cp > op {
+                            let val_str = entry[..op].trim();
+                            let pred_str = entry[op + 1..cp].trim();
+                            let clean_val = clean_gimple_token(
+                                val_str,
+                                &mut temp_map,
+                                &mut temp_count,
+                                &pointer_map,
+                            );
+                            let clean_pred = clean_gimple_label(pred_str);
+                            cur.phis.push((clean_lhs.clone(), clean_val, clean_pred));
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -1158,8 +1636,10 @@ fn parse_gimple_to_tac(gimple_source: &str) -> Result<String, String> {
             || line == "finally"
             || line == "else"
             || line.starts_with("int ")
+            || line.starts_with("unsigned ")
+            || line.starts_with("sizetype ")
+            || line.starts_with("long unsigned ")
             || line.starts_with("void ")
-            || line.starts_with("return ")
             || line.starts_with("# ")
             || line.contains("CLOBBER")
             || line.is_empty()
@@ -1167,151 +1647,299 @@ fn parse_gimple_to_tac(gimple_source: &str) -> Result<String, String> {
             continue;
         }
 
-        // Basic block label: <bb 2> [local count: ...]: or <bb 3>: or <D.3486>: or label:
-        if (line.starts_with("<bb ") || line.starts_with("<D.") || line.starts_with("bb_") || line.ends_with(':')) && line.contains(':') {
-            let lbl = clean_gimple_label(line);
-            defined_labels.insert(lbl.clone());
-            tac_lines.push(format!("{lbl}:"));
-            continue;
+        cur.stmts.push(line);
+    }
+
+    if let Some(b) = current_block {
+        blocks.push(b);
+    }
+
+    if blocks.is_empty() {
+        return Err("No scalar TAC statements could be extracted from GCC intermediate dump".to_string());
+    }
+
+    // Pass 1.5: Register edge assignments (pred_label, target_label) -> [(dest, val)]
+    let mut edge_assignments: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+    for block in &blocks {
+        for (dest, val, pred) in &block.phis {
+            edge_assignments
+                .entry((pred.clone(), block.label.clone()))
+                .or_default()
+                .push((dest.clone(), val.clone()));
+        }
+    }
+
+    // Pass 2: Lower blocks into TAC
+    let mut tac_lines = Vec::new();
+
+    for b_idx in 0..blocks.len() {
+        let block = &blocks[b_idx];
+        defined_labels.insert(block.label.clone());
+        tac_lines.push(format!("{}:", block.label));
+
+        if b_idx == 0 {
+            for (idx, arr) in array_declarations.iter().enumerate() {
+                let base = (idx + 1) * 10000;
+                defined_labels.insert(format!("init_{arr}"));
+                tac_lines.push(format!("{arr} = {base}"));
+            }
         }
 
-        // Conditional branch: if (condition)
-        if line.starts_with("if (") || line.starts_with("if(") {
-            let open = line.find('(').unwrap_or(0);
-            let close = line.rfind(')').unwrap_or(line.len());
-            let cond_expr = &line[open + 1..close];
+        let mut has_terminator = false;
+        let mut s_idx = 0;
+        while s_idx < block.stmts.len() {
+            let line = &block.stmts[s_idx];
+            s_idx += 1;
 
-            let mut then_target = None;
-            let mut else_target = None;
-
-            if line.contains("goto") {
-                let after = &line[close + 1..];
-                if let Some(else_pos) = after.find("else") {
-                    then_target = extract_goto_target(&after[..else_pos]);
-                    else_target = extract_goto_target(&after[else_pos + 4..]);
-                } else {
-                    then_target = extract_goto_target(after);
-                }
+            if line.starts_with("return ") || line == "return;" || line == "return" {
+                has_terminator = true;
+                referenced_labels.insert("bb_exit".to_string());
+                tac_lines.push("goto bb_exit".to_string());
+                break;
             }
 
-            while (then_target.is_none() || else_target.is_none()) && i < lines.len() {
-                let next_line = lines[i];
-                if next_line.starts_with("goto ") || next_line.starts_with("goto<") {
-                    if then_target.is_none() {
-                        then_target = extract_goto_target(next_line);
-                        i += 1;
-                    } else if else_target.is_none() {
-                        else_target = extract_goto_target(next_line);
-                        i += 1;
+            // scanf (...)
+            if line.starts_with("scanf") {
+                let open = line.find('(').unwrap_or(0);
+                let close = line.rfind(')').unwrap_or(line.len());
+                let inner = &line[open + 1..close];
+                let parts = split_arguments(inner);
+                for arg in parts.iter().skip(1) {
+                    let trimmed = arg.trim();
+                    if trimmed.starts_with('&') {
+                        let inner_arg = trimmed.trim_start_matches('&').trim();
+                        if inner_arg.contains('[') && inner_arg.ends_with(']') {
+                            let mem_loc = lower_mem_expr(inner_arg, &mut temp_map, &mut temp_count, &pointer_map, &mut tac_lines);
+                            tac_lines.push(format!("read {mem_loc}"));
+                        } else {
+                            let var = clean_gimple_token(inner_arg, &mut temp_map, &mut temp_count, &pointer_map);
+                            if !var.is_empty() {
+                                tac_lines.push(format!("read {var}"));
+                            }
+                        }
+                    } else {
+                        let var = clean_gimple_token(trimmed, &mut temp_map, &mut temp_count, &pointer_map);
+                        if !var.is_empty() {
+                            tac_lines.push(format!("read mem_{var}"));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // printf (...)
+            if line.starts_with("printf") {
+                let open = line.find('(').unwrap_or(0);
+                let close = line.rfind(')').unwrap_or(line.len());
+                let inner = &line[open + 1..close];
+                let parts = split_arguments(inner);
+                for arg in parts.iter().skip(1) {
+                    let clean_val = clean_gimple_token(arg, &mut temp_map, &mut temp_count, &pointer_map);
+                    if !clean_val.is_empty() {
+                        tac_lines.push(format!("print {clean_val}"));
+                    }
+                }
+                continue;
+            }
+
+            // puts / __builtin_puts ("1")
+            if line.starts_with("__builtin_puts") || line.starts_with("puts") {
+                if let (Some(q1), Some(q2)) = (line.find('"'), line.rfind('"')) {
+                    if q2 > q1 {
+                        let text = &line[q1 + 1..q2];
+                        if let Ok(num) = text.parse::<i32>() {
+                            tac_lines.push(format!("print {num}"));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // if (cond)
+            if line.starts_with("if (") || line.starts_with("if(") {
+                has_terminator = true;
+                let open = line.find('(').unwrap_or(0);
+                let close = line.rfind(')').unwrap_or(line.len());
+                let cond_expr = &line[open + 1..close];
+
+                let mut then_target = None;
+                let mut else_target = None;
+
+                if line.contains("goto") {
+                    let after = &line[close + 1..];
+                    if let Some(else_pos) = after.find("else") {
+                        then_target = extract_goto_target(&after[..else_pos]);
+                        else_target = extract_goto_target(&after[else_pos + 4..]);
+                    } else {
+                        then_target = extract_goto_target(after);
+                    }
+                }
+
+                while (then_target.is_none() || else_target.is_none()) && s_idx < block.stmts.len() {
+                    let next_line = &block.stmts[s_idx];
+                    if next_line.starts_with("goto ") || next_line.starts_with("goto<") {
+                        if then_target.is_none() {
+                            then_target = extract_goto_target(next_line);
+                            s_idx += 1;
+                        } else if else_target.is_none() {
+                            else_target = extract_goto_target(next_line);
+                            s_idx += 1;
+                            break;
+                        }
+                    } else if next_line == "else" {
+                        s_idx += 1;
+                    } else {
                         break;
                     }
-                } else if next_line == "else" {
-                    i += 1;
-                } else {
-                    break;
                 }
-            }
 
-            let cond_val = lower_gimple_condition(cond_expr, &mut temp_map, &mut temp_count, &pointer_map, &mut tac_lines);
-
-            if let Some(else_lbl) = else_target {
-                referenced_labels.insert(else_lbl.clone());
-                tac_lines.push(format!("if_false {cond_val} goto {else_lbl}"));
-            }
-            if let Some(then_lbl) = then_target {
-                referenced_labels.insert(then_lbl.clone());
-                tac_lines.push(format!("goto {then_lbl}"));
-            }
-            continue;
-        }
-
-        // scanf ("...", &a, &b);
-        if line.starts_with("scanf") {
-            let open = line.find('(').unwrap_or(0);
-            let close = line.rfind(')').unwrap_or(line.len());
-            let inner = &line[open + 1..close];
-            let parts = split_arguments(inner);
-            for arg in parts.iter().skip(1) {
-                let var = clean_gimple_token(arg, &mut temp_map, &mut temp_count, &pointer_map);
-                if !var.is_empty() {
-                    tac_lines.push(format!("read {var}"));
+                if else_target.is_none() && b_idx + 1 < blocks.len() {
+                    else_target = Some(blocks[b_idx + 1].label.clone());
                 }
-            }
-            continue;
-        }
 
-        // printf ("...", c);
-        if line.starts_with("printf") {
-            let open = line.find('(').unwrap_or(0);
-            let close = line.rfind(')').unwrap_or(line.len());
-            let inner = &line[open + 1..close];
-            let parts = split_arguments(inner);
-            for arg in parts.iter().skip(1) {
-                let clean_val = clean_gimple_token(arg, &mut temp_map, &mut temp_count, &pointer_map);
-                if !clean_val.is_empty() {
-                    tac_lines.push(format!("print {clean_val}"));
-                }
-            }
-            continue;
-        }
+                let then_lbl = then_target.unwrap_or_else(|| {
+                    if b_idx + 1 < blocks.len() {
+                        blocks[b_idx + 1].label.clone()
+                    } else {
+                        "bb_exit".to_string()
+                    }
+                });
+                let else_lbl = else_target.unwrap_or_else(|| "bb_exit".to_string());
 
-        // GIMPLE binary/copy assignment: dest = left op right; or dest = val;
-        if let Some(eq_pos) = line.find('=') {
-            let lhs = line[..eq_pos].trim();
-            let rhs = line[eq_pos + 1..].trim().trim_end_matches(';');
+                let (op, left, right) = parse_relational_expr(cond_expr);
+                let clean_left = clean_gimple_token(&left, &mut temp_map, &mut temp_count, &pointer_map);
+                let clean_right = clean_gimple_token(&right, &mut temp_map, &mut temp_count, &pointer_map);
 
-            // Skip compiler return variables like D.3436 = 0 or _8 = 0 at the end of main
-            if (lhs.starts_with("D.") || lhs.starts_with('_')) && rhs == "0" && !tac_lines.is_empty() {
+                emit_relational_branch(
+                    op,
+                    &clean_left,
+                    &clean_right,
+                    &block.label,
+                    &then_lbl,
+                    &else_lbl,
+                    &edge_assignments,
+                    &mut temp_count,
+                    &mut tac_lines,
+                    &mut defined_labels,
+                    &mut referenced_labels,
+                );
                 continue;
             }
 
-            let clean_lhs = clean_gimple_token(lhs, &mut temp_map, &mut temp_count, &pointer_map);
-
-            // Track pointer address-of: p = &x
-            if rhs.trim().starts_with('&') {
-                let pointee = clean_gimple_token(rhs.trim().trim_start_matches('&'), &mut temp_map, &mut temp_count, &pointer_map);
-                pointer_map.insert(clean_lhs.clone(), pointee);
+            // goto target
+            if let Some(target) = extract_goto_target(line) {
+                has_terminator = true;
+                if let Some(edges) = edge_assignments.get(&(block.label.clone(), target.clone())) {
+                    for (d, v) in edges {
+                        tac_lines.push(format!("{d} = {v}"));
+                    }
+                }
+                referenced_labels.insert(target.clone());
+                tac_lines.push(format!("goto {target}"));
                 continue;
             }
 
-            // Strip type casts from rhs
-            let clean_rhs_str = if let Some(close_paren) = rhs.find(')') {
-                if rhs.starts_with('(') && !rhs.contains(" * ") && !rhs.contains(" + ") && !rhs.contains(" - ") {
-                    rhs[close_paren + 1..].trim()
+            // Assignment lhs = rhs
+            if let Some(eq_pos) = line.find('=') {
+                let lhs = line[..eq_pos].trim();
+                let rhs = line[eq_pos + 1..].trim().trim_end_matches(';');
+
+                // Skip compiler return variables like D.3436 = 0 or _8 = 0 at the end of main
+                if (lhs.starts_with("D.") || lhs.starts_with('_')) && rhs == "0" && !tac_lines.is_empty() {
+                    continue;
+                }
+
+                // Strip type casts from rhs
+                let clean_rhs_str = if let Some(close_paren) = rhs.find(')') {
+                    if rhs.starts_with('(') && !rhs.contains(" * ") && !rhs.contains(" + ") && !rhs.contains(" - ") {
+                        rhs[close_paren + 1..].trim()
+                    } else {
+                        rhs
+                    }
                 } else {
                     rhs
-                }
-            } else {
-                rhs
-            };
+                };
 
-            let tokens: Vec<&str> = clean_rhs_str.split_whitespace().collect();
-            if tokens.len() == 3 {
-                let left = clean_gimple_token(tokens[0], &mut temp_map, &mut temp_count, &pointer_map);
-                let op = tokens[1];
-                let right = clean_gimple_token(tokens[2], &mut temp_map, &mut temp_count, &pointer_map);
-
-                if OpCode::from_binary_token(op).is_some() {
-                    tac_lines.push(format!("{clean_lhs} = {left} {op} {right}"));
+                // Track pointer address-of: p = &x or p = (type)&x
+                if clean_rhs_str.starts_with('&') {
+                    let clean_lhs = clean_gimple_token(lhs, &mut temp_map, &mut temp_count, &pointer_map);
+                    let pointee = clean_gimple_token(clean_rhs_str.trim_start_matches('&'), &mut temp_map, &mut temp_count, &pointer_map);
+                    pointer_map.insert(clean_lhs.clone(), pointee.clone());
+                    if !defined_labels.contains(&format!("init_{pointee}")) {
+                        defined_labels.insert(format!("init_{pointee}"));
+                        tac_lines.push(format!("{pointee} = 1000"));
+                    }
+                    tac_lines.push(format!("{clean_lhs} = {pointee}"));
+                    continue;
                 }
-            } else if tokens.len() == 1 {
-                let val = clean_gimple_token(tokens[0], &mut temp_map, &mut temp_count, &pointer_map);
-                tac_lines.push(format!("{clean_lhs} = {val}"));
+
+                // If LHS is MEM or array indexing: e.g. MEM[...] = rhs or a[j] = rhs
+                if lhs.starts_with("MEM") || (lhs.contains('[') && lhs.ends_with(']')) {
+                    let mem_dest = lower_mem_expr(lhs, &mut temp_map, &mut temp_count, &pointer_map, &mut tac_lines);
+                    let clean_rhs = clean_gimple_token(clean_rhs_str, &mut temp_map, &mut temp_count, &pointer_map);
+                    tac_lines.push(format!("{mem_dest} = {clean_rhs}"));
+                    continue;
+                }
+
+                let clean_lhs = clean_gimple_token(lhs, &mut temp_map, &mut temp_count, &pointer_map);
+
+                // If RHS is MEM or array indexing: e.g. lhs = MEM[...] or lhs = a[j]
+                if clean_rhs_str.starts_with("MEM") || (clean_rhs_str.contains('[') && clean_rhs_str.ends_with(']')) {
+                    let mem_src = lower_mem_expr(clean_rhs_str, &mut temp_map, &mut temp_count, &pointer_map, &mut tac_lines);
+                    tac_lines.push(format!("{clean_lhs} = {mem_src}"));
+                    continue;
+                }
+
+                // Check for relational expressions on RHS
+                let (rel_op, rel_l, rel_r) = parse_relational_expr(clean_rhs_str);
+                if let Some(op) = rel_op {
+                    let cl_l = clean_gimple_token(&rel_l, &mut temp_map, &mut temp_count, &pointer_map);
+                    let cl_r = clean_gimple_token(&rel_r, &mut temp_map, &mut temp_count, &pointer_map);
+                    emit_relational_assignment(
+                        &clean_lhs,
+                        op,
+                        &cl_l,
+                        &cl_r,
+                        &mut temp_count,
+                        &mut tac_lines,
+                    );
+                    continue;
+                }
+
+                let tokens: Vec<&str> = clean_rhs_str.split_whitespace().collect();
+                if tokens.len() == 3 {
+                    let left = clean_gimple_token(tokens[0], &mut temp_map, &mut temp_count, &pointer_map);
+                    let op = tokens[1];
+                    let right = clean_gimple_token(tokens[2], &mut temp_map, &mut temp_count, &pointer_map);
+
+                    if OpCode::from_binary_token(op).is_some() {
+                        tac_lines.push(format!("{clean_lhs} = {left} {op} {right}"));
+                    }
+                } else if tokens.len() == 1 {
+                    let val = clean_gimple_token(tokens[0], &mut temp_map, &mut temp_count, &pointer_map);
+                    tac_lines.push(format!("{clean_lhs} = {val}"));
+                }
+                continue;
             }
-            continue;
         }
 
-        // Unconditional goto: goto <D.xxxx> or goto <bb 3>; [89.00%]
-        if let Some(target) = extract_goto_target(line) {
-            referenced_labels.insert(target.clone());
-            tac_lines.push(format!("goto {target}"));
-            continue;
+        // Fallthrough to next basic block
+        if !has_terminator && b_idx + 1 < blocks.len() {
+            let next_label = &blocks[b_idx + 1].label;
+            if let Some(edges) = edge_assignments.get(&(block.label.clone(), next_label.clone())) {
+                for (d, v) in edges {
+                    tac_lines.push(format!("{d} = {v}"));
+                }
+            }
         }
     }
 
     if tac_lines.is_empty() {
         return Err("No scalar TAC statements could be extracted from GCC intermediate dump".to_string());
     }
+
+    defined_labels.insert("bb_exit".to_string());
+    tac_lines.push("bb_exit:".to_string());
 
     // Ensure any referenced jump target label is defined at the end of the program
     for lbl in &referenced_labels {
@@ -1387,33 +2015,66 @@ pub fn sanitize_gimple_tac(source: &str) -> String {
                 }
             }
 
-            temp_counter += 1;
-            let cond_temp = format!("t_cond_{}", temp_counter);
-            let normalized_cond = cond_expr
-                .replace("< =", "<=")
-                .replace("> =", ">=")
-                .replace("= =", "==")
-                .replace("! =", "!=");
-            let (left, right) = if let Some((l, r)) = normalized_cond.split_once("<=")
-                .or_else(|| normalized_cond.split_once(">="))
-                .or_else(|| normalized_cond.split_once("=="))
-                .or_else(|| normalized_cond.split_once("!="))
-                .or_else(|| normalized_cond.split_once('<'))
-                .or_else(|| normalized_cond.split_once('>'))
-            {
-                (l.trim(), r.trim())
-            } else {
-                (normalized_cond.trim(), "0")
-            };
-            tac_lines.push(format!("{cond_temp} = {left} - {right}"));
+            let (op, left, right) = parse_relational_expr(cond_expr);
+            let then_lbl = then_target.unwrap_or_else(|| "bb_target".to_string());
+            let else_lbl = else_target.unwrap_or_else(|| "bb_target".to_string());
 
-            if let Some(else_lbl) = else_target {
-                referenced_labels.insert(else_lbl.clone());
-                tac_lines.push(format!("if_false {cond_temp} goto {else_lbl}"));
-            }
-            if let Some(then_lbl) = then_target {
-                referenced_labels.insert(then_lbl.clone());
-                tac_lines.push(format!("goto {then_lbl}"));
+            temp_counter += 1;
+            let t_diff = format!("t_diff_{temp_counter}");
+            temp_counter += 1;
+            let t_sign = format!("t_sign_{temp_counter}");
+            temp_counter += 1;
+            let t_cond = format!("t_cond_{temp_counter}");
+
+            match op {
+                Some(RelOp::Eq) => {
+                    tac_lines.push(format!("{t_diff} = {left} - {right}"));
+                    referenced_labels.insert(then_lbl.clone());
+                    referenced_labels.insert(else_lbl.clone());
+                    tac_lines.push(format!("if_false {t_diff} goto {then_lbl}"));
+                    tac_lines.push(format!("goto {else_lbl}"));
+                }
+                _ => {
+                    match op {
+                        Some(RelOp::Lt) => {
+                            tac_lines.push(format!("{t_diff} = {left} - {right}"));
+                            tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+                            tac_lines.push(format!("{t_cond} = 0 - {t_sign}"));
+                        }
+                        Some(RelOp::Gt) => {
+                            tac_lines.push(format!("{t_diff} = {right} - {left}"));
+                            tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+                            tac_lines.push(format!("{t_cond} = 0 - {t_sign}"));
+                        }
+                        Some(RelOp::Le) => {
+                            tac_lines.push(format!("{t_diff} = {right} - {left}"));
+                            tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+                            temp_counter += 1;
+                            let t_gt = format!("t_gt_{temp_counter}");
+                            tac_lines.push(format!("{t_gt} = 0 - {t_sign}"));
+                            tac_lines.push(format!("{t_cond} = 1 - {t_gt}"));
+                        }
+                        Some(RelOp::Ge) => {
+                            tac_lines.push(format!("{t_diff} = {left} - {right}"));
+                            tac_lines.push(format!("{t_sign} = {t_diff} >> 31"));
+                            temp_counter += 1;
+                            let t_lt = format!("t_lt_{temp_counter}");
+                            tac_lines.push(format!("{t_lt} = 0 - {t_sign}"));
+                            tac_lines.push(format!("{t_cond} = 1 - {t_lt}"));
+                        }
+                        Some(RelOp::Ne) => {
+                            tac_lines.push(format!("{t_cond} = {left} - {right}"));
+                        }
+                        Some(RelOp::Eq) => unreachable!("handled in outer match"),
+                        None => {
+                            tac_lines.push(format!("{t_cond} = {left}"));
+                        }
+                    }
+                    referenced_labels.insert(else_lbl.clone());
+                    referenced_labels.insert(then_lbl.clone());
+                    tac_lines.push(format!("if_false {t_cond} goto {else_lbl}"));
+                    tac_lines.push(format!("goto {then_lbl}"));
+                }
             }
             continue;
         }
@@ -1480,6 +2141,193 @@ mod tests {
     use crate::parser::parse_program;
     use crate::passes::optimize_with_worklist;
     use crate::vm::execute;
+
+    #[test]
+    fn test_quicksort_lowering_and_execution() {
+        let qs_code = r#"
+#include <stdio.h>
+
+int main() {
+    int n;
+    scanf("%d", &n);
+    int a[100];
+    for (int i = 0; i < n; i++) {
+        scanf("%d", &a[i]);
+    }
+
+    int low[100], high[100];
+    int top = -1;
+    top++;
+    low[top] = 0;
+    high[top] = n - 1;
+
+    while (top >= 0) {
+        int l = low[top];
+        int h = high[top];
+        top--;
+
+        int pivot = a[h];
+        int i = l - 1;
+        for (int j = l; j <= h - 1; j++) {
+            if (a[j] <= pivot) {
+                i++;
+                int temp = a[i];
+                a[i] = a[j];
+                a[j] = temp;
+            }
+        }
+        int temp = a[i + 1];
+        a[i + 1] = a[h];
+        a[h] = temp;
+        int p = i + 1;
+
+        if (p - 1 > l) {
+            top++;
+            low[top] = l;
+            high[top] = p - 1;
+        }
+        if (p + 1 < h) {
+            top++;
+            low[top] = p + 1;
+            high[top] = h;
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        printf("%d\n", a[i]);
+    }
+    return 0;
+}
+"#;
+        let tac = lower_c_source_via_gcc_backup(qs_code).expect("Should lower quicksort to TAC");
+        let mut parsed = parse_program(&tac).expect("Generated TAC should parse cleanly");
+        let res = crate::vm::execute_permissive(&parsed, &[4, 9, 3, 7, 5], 10000)
+            .expect("VM should execute without infinite loop");
+        println!("Quicksort TAC:\n{}", tac);
+        println!("Quicksort res.output: {:?}", res.output);
+        assert!(res.steps < 2000, "Should finish in well under 2000 steps, took {}", res.steps);
+        assert_eq!(res.output, vec![3, 5, 7, 9], "Quicksort must output sorted array");
+
+        let cfg = crate::cfg::build(&mut parsed).expect("CFG build");
+        let _report = crate::passes::optimize_with_worklist(&mut parsed, &cfg);
+        let opt_res = crate::vm::execute_permissive(&parsed, &[4, 9, 3, 7, 5], 10000)
+            .expect("Optimized quicksort VM run");
+        assert_eq!(opt_res.output, vec![3, 5, 7, 9], "Optimized quicksort must match original sorted output");
+    }
+
+    #[test]
+    fn test_bubble_sort_lowering_and_execution() {
+        let bubble_code = r#"
+#include <stdio.h>
+int main() {
+    int n;
+    scanf("%d", &n);
+    int a[100];
+    for (int i = 0; i < n; i++) {
+        scanf("%d", &a[i]);
+    }
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = 0; j < n - i - 1; j++) {
+            if (a[j] > a[j + 1]) {
+                int temp = a[j];
+                a[j] = a[j + 1];
+                a[j + 1] = temp;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        printf("%d\n", a[i]);
+    }
+    return 0;
+}
+"#;
+        let tac = lower_c_source_via_gcc_backup(bubble_code).expect("Should lower bubble sort to TAC");
+        println!("Bubble sort TAC:\n{}", tac);
+        let mut parsed = parse_program(&tac).expect("Generated TAC should parse cleanly");
+        let res = crate::vm::execute_permissive(&parsed, &[4, 7, 8, 6, 5], 100000)
+            .expect("VM should execute without infinite loop");
+        println!("Bubble sort res.output: {:?}", res.output);
+        assert_eq!(res.output, vec![5, 6, 7, 8]);
+
+        // Optimize
+        let cfg = crate::cfg::build(&mut parsed).expect("CFG build");
+        let report = crate::passes::optimize_with_worklist(&mut parsed, &cfg);
+        println!("Transformations count: {}", report.transformations.len());
+        for t in &report.transformations {
+            println!("{:?}: {} -> {}", t.pass, t.before, t.after);
+        }
+        println!("Optimized TAC:\n{}", parsed);
+        let opt_res = crate::vm::execute_permissive(&parsed, &[4, 7, 8, 6, 5], 100000)
+            .expect("Optimized VM run");
+        println!("Optimized Bubble sort res.output: {:?}", opt_res.output);
+        assert_eq!(opt_res.output, vec![5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn test_relational_edge_cases_in_loops() {
+        // 1. Countdown while loop (top >= 0) with negative termination
+        let countdown_code = r#"
+#include <stdio.h>
+int main() {
+    int top = 5;
+    int sum = 0;
+    while (top >= 0) {
+        sum += top;
+        top--;
+    }
+    printf("%d\n", sum);
+    return 0;
+}
+"#;
+        let tac1 = lower_c_source_via_gcc_backup(countdown_code).expect("Lower countdown");
+        let prog1 = parse_program(&tac1).expect("Parse countdown TAC");
+        let res1 = crate::vm::execute_permissive(&prog1, &[], 5000).expect("Run countdown");
+        let gcc_out1 = run_c_via_gcc(countdown_code, "").expect("GCC native run");
+        assert_eq!(res1.output, gcc_out1, "Countdown output must match native GCC");
+        assert_eq!(res1.output, vec![15]);
+
+        // 2. Nested loop with <= condition and break/continue
+        let nested_code = r#"
+#include <stdio.h>
+int main() {
+    int sum = 0;
+    for (int i = 0; i <= 3; i++) {
+        for (int j = 0; j <= 2; j++) {
+            if (j == 1) continue;
+            sum += i * 10 + j;
+        }
+    }
+    printf("%d\n", sum);
+    return 0;
+}
+"#;
+        let tac2 = lower_c_source_via_gcc_backup(nested_code).expect("Lower nested");
+        let prog2 = parse_program(&tac2).expect("Parse nested TAC");
+        let res2 = crate::vm::execute_permissive(&prog2, &[], 5000).expect("Run nested");
+        let gcc_out2 = run_c_via_gcc(nested_code, "").expect("GCC native run");
+        assert_eq!(res2.output, gcc_out2, "Nested output must match native GCC");
+
+        // 3. Negative comparison edge cases
+        let neg_code = r#"
+#include <stdio.h>
+int main() {
+    int a = -10, b = -5;
+    if (a < b) printf("1\n"); else printf("0\n");
+    if (a > b) printf("1\n"); else printf("0\n");
+    if (a <= -10) printf("1\n"); else printf("0\n");
+    if (b >= -5) printf("1\n"); else printf("0\n");
+    if (a == -10) printf("1\n"); else printf("0\n");
+    if (a != b) printf("1\n"); else printf("0\n");
+    return 0;
+}
+"#;
+        let tac3 = lower_c_source_via_gcc_backup(neg_code).expect("Lower negative comp");
+        let prog3 = parse_program(&tac3).expect("Parse neg TAC");
+        let res3 = crate::vm::execute_permissive(&prog3, &[], 5000).expect("Run neg");
+        let gcc_out3 = run_c_via_gcc(neg_code, "").expect("GCC native run");
+        assert_eq!(res3.output, gcc_out3, "Negative comparison must match native GCC");
+        assert_eq!(res3.output, vec![1, 0, 1, 1, 1, 1]);
+    }
 
     #[test]
     fn test_looks_like_c_code() {

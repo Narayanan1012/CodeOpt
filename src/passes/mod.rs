@@ -451,6 +451,11 @@ fn instruction_uses_arg2(operation: OpCode) -> bool {
 }
 
 fn is_propagatable(operand: &Operand) -> bool {
+    if let Operand::Var(name) = operand {
+        if name.starts_with("mem_") {
+            return false;
+        }
+    }
     matches!(
         operand,
         Operand::Const(_) | Operand::Var(_) | Operand::Temp(_)
@@ -488,19 +493,39 @@ impl DefUseChains {
             for instruction_id in &block.instruction_ids {
                 let instruction = instruction_by_id[instruction_id];
                 for operand in used_operands(instruction) {
-                    if let Some(key) = operand_key(operand)
-                        && let Some(definition_id) = last_definition.get(&key)
-                    {
-                        consumers_by_definition
-                            .entry(*definition_id)
-                            .or_insert_with(Vec::new)
-                            .push(*instruction_id);
+                    if let Some(key) = operand_key(operand) {
+                        if let Some(ptr) = key.strip_prefix("mem_") {
+                            if let Some(definition_id) = last_definition.get(ptr) {
+                                consumers_by_definition
+                                    .entry(*definition_id)
+                                    .or_insert_with(Vec::new)
+                                    .push(*instruction_id);
+                            }
+                        }
+                        if let Some(definition_id) = last_definition.get(&key) {
+                            consumers_by_definition
+                                .entry(*definition_id)
+                                .or_insert_with(Vec::new)
+                                .push(*instruction_id);
+                        }
+                    }
+                }
+                if let Some(dest_key) = operand_key(&instruction.dest) {
+                    if let Some(ptr) = dest_key.strip_prefix("mem_") {
+                        if let Some(definition_id) = last_definition.get(ptr) {
+                            consumers_by_definition
+                                .entry(*definition_id)
+                                .or_insert_with(Vec::new)
+                                .push(*instruction_id);
+                        }
                     }
                 }
                 if defines_destination(instruction)
                     && let Some(key) = operand_key(&instruction.dest)
                 {
-                    last_definition.insert(key, *instruction_id);
+                    if !key.starts_with("mem_") {
+                        last_definition.insert(key, *instruction_id);
+                    }
                 }
             }
         }
@@ -699,7 +724,15 @@ pub fn eliminate_dead_code(program: &mut Program) -> Vec<Transformation> {
             }
             for op in used_operands(inst) {
                 if let Some(key) = operand_key(op) {
+                    if let Some(ptr) = key.strip_prefix("mem_") {
+                        used.insert(ptr.to_string());
+                    }
                     used.insert(key);
+                }
+            }
+            if let Some(dest_key) = operand_key(&inst.dest) {
+                if let Some(ptr) = dest_key.strip_prefix("mem_") {
+                    used.insert(ptr.to_string());
                 }
             }
         }
@@ -716,6 +749,7 @@ pub fn eliminate_dead_code(program: &mut Program) -> Vec<Transformation> {
             }
             if defines_destination(inst)
                 && let Some(dest_key) = operand_key(&inst.dest)
+                && !dest_key.starts_with("mem_")
                 && !used.contains(&dest_key)
             {
                 let before = inst.clone();

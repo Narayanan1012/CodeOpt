@@ -18,6 +18,11 @@ use crate::tui::{
 };
 
 pub fn render_playground(frame: &mut Frame, app: &App, area: Rect) {
+    if app.playground_stats_open {
+        super::playground_stats::render_playground_stats(frame, app, area);
+        return;
+    }
+
     if app.playground_fullscreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -52,6 +57,8 @@ pub fn render_playground(frame: &mut Frame, app: &App, area: Rect) {
         render_reset_confirm_modal(frame, area);
     } else if app.load_file_modal_open {
         render_load_path_modal(frame, app, area);
+    } else if app.playground_input_modal_open {
+        render_terminal_input_modal(frame, app, area);
     }
 }
 
@@ -493,30 +500,64 @@ fn render_playground_bottom(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(Span::styled("Press [i] Edit  [f] Fullscreen  [C] Convert  [R] Run VM  [L] Load  [X] Reset", Style::default().fg(COLOR_TEXT_MUTED))),
         ]
     } else {
-        vec![
+        let mut lines = vec![
             Line::from(vec![
-                Span::styled(" Test Inputs:       ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled(" Terminal Stdin:    ", Style::default().fg(COLOR_TEXT_HEAD)),
                 Span::styled(format!("{:?}", app.playground_inputs), Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
             ]),
-            Line::from(vec![
-                Span::styled(" Original Output:   ", Style::default().fg(COLOR_TEXT_HEAD)),
-                Span::styled(format!("{:?}", app.playground_orig_out), Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(vec![
-                Span::styled(" Optimized Output:  ", Style::default().fg(COLOR_TEXT_HEAD)),
-                Span::styled(format!("{:?}", app.playground_opt_out), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(vec![
-                Span::styled(" Equivalence Check: ", Style::default().fg(COLOR_TEXT_HEAD)),
-                if app.playground_equiv_pass {
-                    Span::styled("100% IDENTICAL OUTPUTS (VERIFIED)", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
-                } else {
-                    Span::styled("OUTPUT MISMATCH DETECTED", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))
-                },
-            ]),
-            Line::from(""),
-            Line::from(Span::styled("Press [i] Edit  [f] Fullscreen  [C] Convert  [R] Run VM  [L] Load  [X] Reset", Style::default().fg(COLOR_TEXT_MUTED))),
-        ]
+        ];
+
+        if let Some(gcc_out) = &app.playground_gcc_out {
+            lines.push(Line::from(vec![
+                Span::styled(" Native GCC Stdout: ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled(format!("{:?}", gcc_out), Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+            ]));
+        }
+
+        lines.push(Line::from(vec![
+            Span::styled(" Original Output:   ", Style::default().fg(COLOR_TEXT_HEAD)),
+            Span::styled(format!("{:?}", app.playground_orig_out), Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" Optimized Output:  ", Style::default().fg(COLOR_TEXT_HEAD)),
+            Span::styled(format!("{:?}", app.playground_opt_out), Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+        ]));
+
+        lines.push(Line::from(vec![
+            Span::styled(" Equivalence Check: ", Style::default().fg(COLOR_TEXT_HEAD)),
+            if app.playground_equiv_pass {
+                Span::styled("100% IDENTICAL OUTPUTS (VERIFIED)", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled("OUTPUT MISMATCH DETECTED", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD))
+            },
+        ]));
+
+        if let Some(err) = &app.playground_vm_error {
+            lines.push(Line::from(vec![
+                Span::styled(" VM Error Message:  ", Style::default().fg(COLOR_DANGER).add_modifier(Modifier::BOLD)),
+                Span::styled(err, Style::default().fg(COLOR_WARNING)),
+            ]));
+        } else if app.playground_orig_steps > 0 {
+            let speedup = if app.playground_opt_steps > 0 {
+                app.playground_orig_steps as f64 / app.playground_opt_steps as f64
+            } else {
+                1.0
+            };
+            lines.push(Line::from(vec![
+                Span::styled(" Execution Metrics: ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled(format!("{} -> {} steps ({:.2}x speedup) │ Duration: {}µs -> {}µs", app.playground_orig_steps, app.playground_opt_steps, speedup, app.playground_orig_time_us, app.playground_opt_time_us), Style::default().fg(COLOR_TEXT_BODY)),
+            ]));
+        }
+
+        lines.push(Line::from(vec![
+            Span::styled(" Statistics Deck:   ", Style::default().fg(COLOR_TEXT_HEAD)),
+            Span::styled("READY — PRESS 'S' FOR SECTION 5 METRICS & AUDIT", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+        ]));
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Press [i] Edit  [f] Fullscreen  [C] Convert  [R] Run VM (Inputs)  [S] Stats  [L] Load  [X] Reset", Style::default().fg(COLOR_TEXT_MUTED))));
+
+        lines
     };
 
     let vm_widget = Paragraph::new(vm_lines).block(vm_block);
@@ -541,17 +582,19 @@ fn render_playground_footer(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Line::from(vec![
                 Span::styled(" [i] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
-                Span::styled("Edit Buffer  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("Edit  ", Style::default().fg(COLOR_TEXT_BODY)),
                 Span::styled(" [f / Esc] ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-                Span::styled("Exit Fullscreen (Split View)  ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled("Exit Fullscreen  ", Style::default().fg(COLOR_TEXT_HEAD)),
                 Span::styled(" [C] ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
-                Span::styled("Convert & Optimize  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("Convert  ", Style::default().fg(COLOR_TEXT_BODY)),
                 Span::styled(" [R] ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
-                Span::styled("Run Dual VM  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("Run (Terminal Stdin)  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled(" [S] ", Style::default().fg(if app.playground_vm_executed { COLOR_PINK } else { COLOR_TEXT_MUTED }).add_modifier(Modifier::BOLD)),
+                Span::styled(if app.playground_vm_executed { "Statistics Deck  " } else { "Stats (Locked)  " }, Style::default().fg(if app.playground_vm_executed { COLOR_TEXT_HEAD } else { COLOR_TEXT_MUTED })),
                 Span::styled(" [L] ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-                Span::styled("Load File  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("Load  ", Style::default().fg(COLOR_TEXT_BODY)),
                 Span::styled(" [X] ", Style::default().fg(COLOR_TEXT_MUTED).add_modifier(Modifier::BOLD)),
-                Span::styled("Reset Code  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("Reset  ", Style::default().fg(COLOR_TEXT_BODY)),
                 Span::styled(" [Q] ", Style::default().fg(COLOR_TEXT_MUTED).add_modifier(Modifier::BOLD)),
                 Span::styled("Quit", Style::default().fg(COLOR_TEXT_MUTED)),
             ])
@@ -573,19 +616,21 @@ fn render_playground_footer(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Line::from(vec![
                 Span::styled(" [i] ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
-                Span::styled("Edit Buffer  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("Edit  ", Style::default().fg(COLOR_TEXT_BODY)),
                 Span::styled(" [f] ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-                Span::styled("Fullscreen Editor  ", Style::default().fg(COLOR_TEXT_HEAD)),
+                Span::styled("Fullscreen  ", Style::default().fg(COLOR_TEXT_HEAD)),
                 Span::styled(" [C] ", Style::default().fg(COLOR_WARNING).add_modifier(Modifier::BOLD)),
-                Span::styled("Convert & Optimize  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("Convert  ", Style::default().fg(COLOR_TEXT_BODY)),
                 Span::styled(" [R] ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
-                Span::styled("Run Dual VM & Verify  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("Run (Terminal Stdin)  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled(" [S] ", Style::default().fg(if app.playground_vm_executed { COLOR_PINK } else { COLOR_TEXT_MUTED }).add_modifier(Modifier::BOLD)),
+                Span::styled(if app.playground_vm_executed { "Statistics Deck  " } else { "Stats (Locked)  " }, Style::default().fg(if app.playground_vm_executed { COLOR_TEXT_HEAD } else { COLOR_TEXT_MUTED })),
                 Span::styled(" [Esc] ", Style::default().fg(COLOR_INDIGO).add_modifier(Modifier::BOLD)),
                 Span::styled("Home  ", Style::default().fg(COLOR_TEXT_BODY)),
                 Span::styled(" [L] ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
-                Span::styled("Load File  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("Load  ", Style::default().fg(COLOR_TEXT_BODY)),
                 Span::styled(" [X] ", Style::default().fg(COLOR_TEXT_MUTED).add_modifier(Modifier::BOLD)),
-                Span::styled("Reset Code  ", Style::default().fg(COLOR_TEXT_BODY)),
+                Span::styled("Reset  ", Style::default().fg(COLOR_TEXT_BODY)),
                 Span::styled(" [Q] ", Style::default().fg(COLOR_TEXT_MUTED).add_modifier(Modifier::BOLD)),
                 Span::styled("Quit", Style::default().fg(COLOR_TEXT_MUTED)),
             ])
@@ -670,6 +715,51 @@ fn render_reset_confirm_modal(frame: &mut Frame, area: Rect) {
             Span::styled("Yes, Reset Buffer   ", Style::default().fg(COLOR_TEXT_BODY)),
             Span::styled(" [N / Esc] ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
             Span::styled("Cancel & Keep Code", Style::default().fg(COLOR_TEXT_BODY)),
+        ]),
+    ];
+
+    let widget = Paragraph::new(content).block(block);
+    frame.render_widget(widget, popup_area);
+}
+
+fn render_terminal_input_modal(frame: &mut Frame, app: &App, area: Rect) {
+    let popup_width = 68.min(area.width.saturating_sub(4));
+    let popup_height = 9.min(area.height.saturating_sub(2));
+
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(COLOR_CYAN))
+        .style(Style::default().bg(COLOR_PANEL_BG))
+        .title(Line::from(vec![
+            Span::styled(" GCC Terminal Standard Input (stdin) ", Style::default().fg(COLOR_CYAN).add_modifier(Modifier::BOLD)),
+        ]));
+
+    let content = vec![
+        Line::from(Span::styled(" Enter whitespace-separated integers for read / scanf:", Style::default().fg(COLOR_TEXT_HEAD))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Stdin: ", Style::default().fg(COLOR_TEXT_HEAD).add_modifier(Modifier::BOLD)),
+            Span::styled(&app.playground_input_string, Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+            Span::styled("█", Style::default().fg(COLOR_CYAN)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" [Enter] ", Style::default().fg(COLOR_SUCCESS).add_modifier(Modifier::BOLD)),
+            Span::styled("Execute VM   ", Style::default().fg(COLOR_TEXT_BODY)),
+            Span::styled(" [Ctrl+V] ", Style::default().fg(COLOR_PINK).add_modifier(Modifier::BOLD)),
+            Span::styled("Paste   ", Style::default().fg(COLOR_TEXT_BODY)),
+            Span::styled(" [Esc] ", Style::default().fg(COLOR_TEXT_MUTED).add_modifier(Modifier::BOLD)),
+            Span::styled("Cancel", Style::default().fg(COLOR_TEXT_MUTED)),
         ]),
     ];
 
